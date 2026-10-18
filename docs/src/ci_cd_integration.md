@@ -102,6 +102,10 @@ jobs:
       - name: Run Budget Report (Tier B)
         if: github.event_name == 'push'
         run: cargo run --bin cargo-budget-report -- budget-report --json --validate > current_report.json
+      # Even when zero simulations succeed, --json still writes a valid
+      # envelope document (empty `snapshots`) rather than an empty file, so
+      # the `jq` and artifact steps below keep working; --csv likewise emits
+      # its header row, and --markdown its header/footer shell.
 
       - name: Write Placeholder Report (fork PR)
         if: github.event_name != 'push'
@@ -305,13 +309,13 @@ Always build WASM with the same `[profile.release]` settings locally and in CI. 
 | Code | Constant | Meaning | CI should… |
 | ---- | -------- | ------- | ---------- |
 | `0` | `EXIT_SUCCESS` | The run succeeded; all measurements are within limits and tolerances. | Continue. |
-| `1` | `EXIT_GENERIC_FAILURE` | An unexpected failure that is neither a budget/regression result nor a network fault (e.g. the contract WASM failed to build). | Fail the job; inspect the log. |
+| `1` | `EXIT_GENERIC_FAILURE` | An unexpected failure that is neither a budget/regression result nor a network fault (e.g. the contract WASM failed to build), or a deterministic `--validate` decode mismatch (reproducible — retrying the same inputs fails the same way). | Fail the job; inspect the log. Do **not** retry a `--validate` mismatch. |
 | `3` | `EXIT_CONFIG_ERROR` | `budget.toml` is malformed, a required configuration value is missing, or another configuration-level mistake was detected. | Fail the job; fix the config. Do **not** retry. |
 | `4` | `EXIT_BUDGET_EXCEEDED` | A measured resource breached a configured `--check` limit. | Fail the job; treat as a budget regression. |
 | `5` | `EXIT_REGRESSION` | A regression was detected beyond tolerance when comparing against a baseline (`--check-baseline`). | Fail the job; treat as a code regression. |
-| `6` | `EXIT_NETWORK_FAILURE` | A network or infrastructure failure (RPC error, the `stellar` CLI could not be spawned, a simulation failed to produce metrics, or `--validate` decode failure). | Retry; results from this run are unreliable. |
+| `6` | `EXIT_NETWORK_FAILURE` | A network or infrastructure failure (RPC error, the `stellar` CLI could not be spawned, or a simulation failed to produce metrics). A `--validate` decode mismatch is **not** in this class — it exits `1`. | Retry; results from this run are unreliable. |
 
-The codes are chosen to avoid the values with reserved meaning in POSIX shells (126, 127, and 128 + N for fatal signals) and to stay clear of `clap`'s own exit code `2`, which `cargo-budget-report` uses for argument-parse errors before `main` runs. When more than one outcome occurs in a single run, the most actionable wins: **regression beats budget-exceeded beats network-failure**. A regression is a real signal that should block a PR, whereas a network fault is safe to retry, so surfacing the regression takes priority.
+The codes are chosen to avoid the values with reserved meaning in POSIX shells (126, 127, and 128 + N for fatal signals) and to stay clear of `clap`'s own exit code `2`, which `cargo-budget-report` uses for argument-parse errors before `main` runs. When more than one outcome occurs in a single run, the most actionable wins: **regression beats budget-exceeded beats validation-mismatch (generic) beats network-failure**. A regression is a real signal that should block a PR, whereas a network fault is safe to retry, so surfacing the regression takes priority — and a deterministic validation mismatch is never reported as a retryable network fault.
 
 ### Example workflow that branches on the exit code
 

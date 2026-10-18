@@ -5,7 +5,8 @@ pub enum ColorChoice {
     /// empty (the no-color.org convention).
     #[default]
     Auto,
-    /// Always emit colour, even into pipes and files.
+    /// Always emit colour, even into pipes and files. `NO_COLOR` still
+    /// suppresses colour when set to a non-empty value.
     Always,
     /// Never emit colour.
     Never,

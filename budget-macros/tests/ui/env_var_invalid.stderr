@@ -1,0 +1,7 @@
+error: env var `UI_TEST_INVALID_BUDGET` has value "not-a-u64", which is not a valid u64
+ --> tests/ui/env_var_invalid.rs:3:1
+  |
+3 | #[budget_cpu_lt(env = "UI_TEST_INVALID_BUDGET")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `budget_cpu_lt` (in Nightly builds, run with -Z macro-backtrace for more info)

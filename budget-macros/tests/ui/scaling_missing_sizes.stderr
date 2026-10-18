@@ -1,0 +1,7 @@
+error: unexpected end of input, missing required field `sizes`
+ --> tests/ui/scaling_missing_sizes.rs:6:1
+  |
+6 | #[budget_scaling(model = linear, tolerance = 0.3)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `budget_scaling` (in Nightly builds, run with -Z macro-backtrace for more info)

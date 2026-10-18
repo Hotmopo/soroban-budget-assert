@@ -190,6 +190,8 @@ pub enum SimulationOutcome {
         read_bytes: u32,
         /// Write bytes consumed by simulation.
         write_bytes: u32,
+        /// Optional memory bytes consumed by simulation.
+        memory_bytes: Option<u32>,
         /// Base64-encoded `SorobanTransactionData` from the RPC response.
         transaction_data_xdr: String,
     },

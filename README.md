@@ -67,15 +67,15 @@ Example: `https://your-org.github.io/your-repo/dashboard.html?limit=100`.
 
 ## ⚙️ Supported Versions & Compatibility
 
-The workspace does not pin a single `soroban-sdk` version — the two contract fixtures pin different ones, and the reporting CLI depends on the XDR decoder rather than the SDK. The manifest dependencies (the source of truth for intent; `Cargo.lock` only records resolution) are:
+The workspace pins `soroban-sdk` and `stellar-xdr` in its manifests. The manifest dependencies (the source of truth for intent; `Cargo.lock` only records resolution) are:
 
 | Crate                                                                    | Manifest dependency                                                                                                 |
 | :----------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------ |
-| `amm-pool-contract` ([manifest](amm-pool-contract/Cargo.toml))           | `soroban-sdk` = `"22.0.11"` (also as a dev-dependency with the `testutils` feature)                                 |
-| `host-function-contract` ([manifest](host-function-contract/Cargo.toml)) | `soroban-sdk` = `"22.0.0"`                                                                                          |
-| `cargo-budget-report` ([manifest](cargo-budget-report/Cargo.toml))       | `stellar-xdr` = `"22.1.0"` (used for decoding transaction simulation responses; no direct `soroban-sdk` dependency) |
+| `amm-pool-contract` ([manifest](amm-pool-contract/Cargo.toml))           | `soroban-sdk` = `"27.0.3"` (also as a dev-dependency with the `testutils` feature) |
+| `host-function-contract` ([manifest](host-function-contract/Cargo.toml)) | `soroban-sdk` = `"27.0.3"` |
+| `cargo-budget-report` ([manifest](cargo-budget-report/Cargo.toml))       | `stellar-xdr` = `"27.0.0"` (used for decoding transaction simulation responses) |
 
-- **Corresponding Stellar Protocol**: **Protocol 22**
+- **Corresponding Stellar Protocol**: **Protocol 27**
 
 ### What "Supported" means here
 
@@ -85,9 +85,9 @@ A row marked **Supported** means: every workspace crate builds and passes `cargo
 
 | SDK Version     | Protocol Version | Status        | Notes                                                                                                                                                                                                                                                                                                                                                                                                               |
 | :-------------- | :--------------- | :------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **`< 22.0.0`**  | `< 22`           | **Untested**  | Older protocols may use different transaction/resource schemas.                                                                                                                                                                                                                                                                                                                                                     |
-| **`22.0.x`**    | `22`             | **Supported** | Matches all pinned manifest dependencies: `soroban-sdk` `22.0.11` (`amm-pool-contract`), `soroban-sdk` `22.0.0` (`host-function-contract`), `stellar-xdr` `22.1.0` (`cargo-budget-report`). Note that the two fixtures pin different patch versions of the same minor line; whether to unify them is a separate concern not covered by this table.                                                                  |
-| **`>= 23.0.0`** | `>= 23`          | **Untested**  | Future protocol upgrades or XDR schema changes (e.g. key/field renames) may break parsing. Migration to newer SDK/XDR versions is actively worked on — see [#382](https://github.com/Tollcraft/soroban-budget-assert/issues/382) (soroban-sdk/stellar-xdr migration) and [#383](https://github.com/Tollcraft/soroban-budget-assert/issues/383) (wasmparser migration) — so the project is not stuck on protocol 22. |
+| **Older than the pinned line** | Older protocol | **Untested**  | Older protocols may use different transaction/resource schemas. |
+| **`27.0.x`**    | `27`             | **Supported** | Matches the pinned `soroban-sdk` `27.0.3` and `stellar-xdr` `27.0.0` manifest dependencies. |
+| **Future SDK/XDR versions** | Future protocol | **Untested**  | Future protocol upgrades or XDR schema changes may break parsing. |
 
 ---
 
@@ -215,14 +215,14 @@ Each failure mode exits with its own code, so CI can branch on the outcome
 (for example, retrying a network failure but not a budget breach). Every
 non-zero code still means "the run failed", so `$? -ne 0` checks keep working.
 
-| Code | Meaning                                                                 |
-| ---- | ----------------------------------------------------------------------- |
-| `0`  | Success (and every `--check` limit passed)                              |
-| `1`  | Generic failure (build failure, unexpected I/O, …)                      |
-| `3`  | Config error (e.g. malformed or incomplete `budget.toml`)               |
-| `4`  | Budget exceeded — a `--check` limit was breached                        |
-| `5`  | Regression beyond the configured tolerance against a baseline           |
-| `6`  | Network / infrastructure failure — results unreliable, retrying is safe |
+| Code | Meaning                                                                                     |
+| ---- | ------------------------------------------------------------------------------------------- |
+| `0`  | Success (and every `--check` limit passed)                                                  |
+| `1`  | Generic failure (build failure, unexpected I/O, or a deterministic `--validate` mismatch — do not retry) |
+| `3`  | Config error (e.g. malformed or incomplete `budget.toml`)                                   |
+| `4`  | Budget exceeded — a `--check` limit was breached                                            |
+| `5`  | Regression beyond the configured tolerance against a baseline                               |
+| `6`  | Network / infrastructure failure (RPC error, simulation produced no metrics — results unreliable, retrying is safe; `--validate` mismatches are code `1`, not `6`) |
 
 Code `2` is reserved for `clap` argument-parse errors. The codes are defined in
 `cargo-budget-report/src/error.rs` and pinned by the process-level tests in

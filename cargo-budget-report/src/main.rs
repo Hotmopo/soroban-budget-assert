@@ -614,13 +614,13 @@ fn color_enabled_with(
     no_color_env_set: bool,
     stdout_is_terminal: bool,
 ) -> bool {
-    if no_color_env_set || !stdout_is_terminal {
+    if no_color_env_set {
         return false;
     }
     match choice {
         ColorChoice::Always => true,
         ColorChoice::Never => false,
-        ColorChoice::Auto => true,
+        ColorChoice::Auto => stdout_is_terminal,
     }
 }
 
@@ -803,7 +803,15 @@ pub(crate) fn format_with_commas_and_units(value: u64, metric: &str) -> String {
 /// Returns an error if the RPC response contains an `"error"` field, if
 /// `transactionData` is missing or not a string, or if the base64 XDR
 /// cannot be decoded.
+#[allow(dead_code)]
 fn extract_metrics(rpc_response: &serde_json::Value) -> Result<(u32, u32, u32)> {
+    let (instructions, read_bytes, write_bytes, _) = extract_metrics_with_memory(rpc_response)?;
+    Ok((instructions, read_bytes, write_bytes))
+}
+
+fn extract_metrics_with_memory(
+    rpc_response: &serde_json::Value,
+) -> Result<(u32, u32, u32, Option<u32>)> {
     if let Some(error) = rpc_response.get("error") {
         return Err(Error::Rpc(error.to_string()));
     }
@@ -826,6 +834,22 @@ fn extract_metrics(rpc_response: &serde_json::Value) -> Result<(u32, u32, u32)> 
     let tx_data = SorobanTransactionData::from_xdr_base64(tx_data_b64, Limits::none())
         .map_err(|e| Error::Xdr(format!("Failed to decode SorobanTransactionData: {}", e)))?;
 
+    let memory_bytes = rpc_response
+        .get("result")
+        .and_then(|result| result.get("cost"))
+        .and_then(|cost| cost.get("memBytes"))
+        .map(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+                .ok_or_else(|| Error::Message("result.cost.memBytes must be an integer".into()))
+                .and_then(|value| {
+                    u32::try_from(value)
+                        .map_err(|_| Error::Message("result.cost.memBytes exceeds u32::MAX".into()))
+                })
+        })
+        .transpose()?;
+
     Ok((
         tx_data.resources.instructions,
         // Renamed in Protocol 23 XDR: footprint reads that hit disk-backed
@@ -833,6 +857,7 @@ fn extract_metrics(rpc_response: &serde_json::Value) -> Result<(u32, u32, u32)> 
         // as read bytes. This is the field the report's "Read Bytes" now tracks.
         tx_data.resources.disk_read_bytes,
         tx_data.resources.write_bytes,
+        memory_bytes,
     ))
 }
 
@@ -969,13 +994,16 @@ fn simulate_function(
         .as_str()
         .map(|s| s.to_string());
 
-    match extract_metrics(&rpc_resp) {
-        Ok((instructions, read_bytes, write_bytes)) => Ok(SimulationOutcome::Metrics {
-            instructions,
-            read_bytes,
-            write_bytes,
-            transaction_data_xdr: tx_data_xdr_b64.unwrap_or_default(),
-        }),
+    match extract_metrics_with_memory(&rpc_resp) {
+        Ok((instructions, read_bytes, write_bytes, memory_bytes)) => {
+            Ok(SimulationOutcome::Metrics {
+                instructions,
+                read_bytes,
+                write_bytes,
+                memory_bytes,
+                transaction_data_xdr: tx_data_xdr_b64.unwrap_or_default(),
+            })
+        }
         Err(err) => Ok(SimulationOutcome::Failed(
             SimulationFailure::MetricsExtraction(format!("{:#}", err)),
         )),
@@ -1025,14 +1053,27 @@ pub(crate) fn resolve_tolerance(
 /// Decide the exit code from the run's boolean outcomes.
 ///
 /// Precedence (most actionable first): regression beyond tolerance beats a
-/// budget-exceeded result, which beats a network/infrastructure fault. A
+/// budget-exceeded result, which beats a deterministic `--validate`
+/// decode mismatch, which beats a network/infrastructure fault. A
 /// regression is a real signal that should block a PR, whereas a network
 /// fault is safe to retry, so surfacing the regression wins when both occur.
-fn classify_outcome(has_regressions: bool, budget_exceeded: bool, network_failure: bool) -> i32 {
+/// A validation mismatch is deterministic and reproducible — retrying the
+/// same inputs reproduces it — so it maps to the generic (non-retryable)
+/// failure code, never to the network code. Callers must pass
+/// `--validate` disagreements as `validation_failed`, not as
+/// `network_failure`.
+fn classify_outcome(
+    has_regressions: bool,
+    budget_exceeded: bool,
+    validation_failed: bool,
+    network_failure: bool,
+) -> i32 {
     if has_regressions {
         EXIT_REGRESSION
     } else if budget_exceeded {
         EXIT_BUDGET_EXCEEDED
+    } else if validation_failed {
+        crate::error::EXIT_GENERIC_FAILURE
     } else if network_failure {
         EXIT_NETWORK_FAILURE
     } else {
@@ -1390,6 +1431,69 @@ fn deploy_contract_with_retry(
     }
 }
 
+/// Resolve the `--derive-limits` margin from CLI flags or `budget.toml` (#862).
+///
+/// CLI overrides win over `budget.toml`: when any `--margin-*` flag is
+/// present, all four must be (a partial set errors naming the missing
+/// flags) instead of falling through to the toml fallback. With no CLI
+/// flags, a complete `[margin]` table is used; an absent or incomplete
+/// table is the `no margin supplied` error. Pure over its inputs so each
+/// failure branch is unit-testable without running a derivation.
+pub(crate) fn resolve_derive_margin(
+    cli_cpu: Option<&str>,
+    cli_memory: Option<&str>,
+    cli_read: Option<&str>,
+    cli_write: Option<&str>,
+    toml_margin: Option<MarginToml>,
+) -> Result<Margin> {
+    fn parse_cli_margin(field: &str, raw: Option<&str>) -> Result<Option<f64>> {
+        match raw {
+            None => Ok(None),
+            Some(text) => text
+                .trim()
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|e| Error::Message(format!("invalid --margin-{field} `{text}`: {e}"))),
+        }
+    }
+    let cli_parts = [
+        ("cpu", parse_cli_margin("cpu", cli_cpu)?),
+        ("memory", parse_cli_margin("memory", cli_memory)?),
+        ("read", parse_cli_margin("read", cli_read)?),
+        ("write", parse_cli_margin("write", cli_write)?),
+    ];
+    let cli_any = cli_parts.iter().any(|(_, v)| v.is_some());
+
+    if cli_any {
+        let missing: Vec<&str> = cli_parts
+            .iter()
+            .filter_map(|(name, v)| if v.is_none() { Some(*name) } else { None })
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Message(format!(
+                "CLI margin is partially set; supply all four \
+                 --margin-{{cpu,memory,read,write}} flags or none of them \
+                 (missing: {missing:?})"
+            )));
+        }
+        let cpu = cli_parts[0].1.unwrap();
+        let memory = cli_parts[1].1.unwrap();
+        let read = cli_parts[2].1.unwrap();
+        let write = cli_parts[3].1.unwrap();
+        Margin::new(cpu, memory, read, write)
+    } else {
+        match toml_margin.filter(|m| m.is_complete()) {
+            Some(m) => m.into_margin(),
+            None => Err(Error::Message(
+                "no margin supplied; pass --margin-cpu / --margin-memory / \
+                 --margin-read / --margin-write, or add a complete [margin] \
+                 section to budget.toml"
+                    .into(),
+            )),
+        }
+    }
+}
+
 fn run_derive_mode(args: &BudgetReportArgs, toml_config: &BudgetToml) -> Result<()> {
     let Mode::Derive(out_env, out_provenance) = Mode::from_args(args) else {
         return Err(Error::Message(
@@ -1411,60 +1515,13 @@ fn run_derive_mode(args: &BudgetReportArgs, toml_config: &BudgetToml) -> Result<
     //    Detect missing-vs-present on the CLI side first so a partial
     //    CLI override errors out instead of falling through to the
     //    toml fallback (which would silently change behaviour).
-    fn parse_cli_margin(field: &str, raw: Option<&String>) -> Result<Option<f64>> {
-        match raw {
-            None => Ok(None),
-            Some(text) => text
-                .trim()
-                .parse::<f64>()
-                .map(Some)
-                .map_err(|e| Error::Message(format!("invalid --margin-{field} `{text}`: {e}"))),
-        }
-    }
-    let cli_parts = [
-        ("cpu", parse_cli_margin("cpu", args.margin_cpu.as_ref())?),
-        (
-            "memory",
-            parse_cli_margin("memory", args.margin_memory.as_ref())?,
-        ),
-        ("read", parse_cli_margin("read", args.margin_read.as_ref())?),
-        (
-            "write",
-            parse_cli_margin("write", args.margin_write.as_ref())?,
-        ),
-    ];
-    let cli_any = cli_parts.iter().any(|(_, v)| v.is_some());
-
-    let margin = if cli_any {
-        let missing: Vec<&str> = cli_parts
-            .iter()
-            .filter_map(|(name, v)| if v.is_none() { Some(*name) } else { None })
-            .collect();
-        if !missing.is_empty() {
-            return Err(Error::Message(format!(
-                "CLI margin is partially set; supply all four \
-                 --margin-{{cpu,memory,read,write}} flags or none of them \
-                 (missing: {missing:?})"
-            )));
-        }
-        let cpu = cli_parts[0].1.unwrap();
-        let memory = cli_parts[1].1.unwrap();
-        let read = cli_parts[2].1.unwrap();
-        let write = cli_parts[3].1.unwrap();
-        Margin::new(cpu, memory, read, write)?
-    } else {
-        match toml_config.margin.filter(|m| m.is_complete()) {
-            Some(m) => m.into_margin()?,
-            None => {
-                return Err(Error::Message(
-                    "no margin supplied; pass --margin-cpu / --margin-memory / \
-                     --margin-read / --margin-write, or add a complete [margin] \
-                     section to budget.toml"
-                        .into(),
-                ));
-            }
-        }
-    };
+    let margin = resolve_derive_margin(
+        args.margin_cpu.as_deref(),
+        args.margin_memory.as_deref(),
+        args.margin_read.as_deref(),
+        args.margin_write.as_deref(),
+        toml_config.margin,
+    )?;
 
     // 3) Lift budget.toml scenarios into the derivation config.
     let scenarios: BTreeMap<String, Vec<String>> = toml_config
@@ -1681,6 +1738,26 @@ fn normalized_argv() -> Vec<std::ffi::OsString> {
     argv
 }
 
+/// Effective simulation worker count for one contract's task list (#863).
+///
+/// `--concurrency 0` parses successfully (see
+/// `test_concurrency_zero_is_accepted_at_parse_time`) and is clamped to a
+/// single sequential worker here; a value above the task count clamps down
+/// to the number of tasks so no idle worker is spawned. Never returns 0.
+pub(crate) fn worker_count(concurrency: usize, n_tasks: usize) -> usize {
+    concurrency.max(1).min(n_tasks.max(1))
+}
+
+/// Whether `--validate` runs for a simulated function (#861).
+///
+/// Replay mode serves every response from a fixture and cannot assume the
+/// `stellar xdr decode` subcommand exists, so validation is silently
+/// skipped there even when the flag is present. Pure so the run-mode
+/// branch is unit-testable without hitting the network.
+pub(crate) fn should_validate(validate: bool, replay: &Option<String>) -> bool {
+    validate && replay.is_none()
+}
+
 fn run() -> Result<i32> {
     let CargoCli::BudgetReport(args) = CargoCli::parse_from(normalized_argv());
 
@@ -1758,6 +1835,17 @@ fn run() -> Result<i32> {
             .or(toml_config.source.clone())
             .context("missing --source or budget.toml source field")?;
         network_guard::ensure_deploy_allowed(&network, args.allow_mainnet)?;
+        let watch_override = match (&args.rpc_url, &args.network_passphrase) {
+            (Some(rpc_url), Some(passphrase)) => Some(live::NetworkOverride {
+                rpc_url: rpc_url.clone(),
+                network_passphrase: passphrase.clone(),
+            }),
+            _ => None,
+        };
+        let endpoint = live::resolve_rpc_url(&network, watch_override.as_ref())?;
+        if !args.quiet {
+            eprintln!("Using RPC endpoint {}", endpoint);
+        }
         return watch::watch_loop(
             &args,
             metadata,
@@ -1804,7 +1892,9 @@ fn run() -> Result<i32> {
         }
     }
 
+    let endpoint = live::resolve_rpc_url(&network, net_override.as_ref())?;
     if !args.quiet {
+        eprintln!("Using RPC endpoint {}", endpoint);
         eprintln!("Discovering workspace members...");
     }
     let metadata = MetadataCommand::new()
@@ -2081,7 +2171,7 @@ fn run() -> Result<i32> {
         }
 
         let concurrency = args.concurrency.max(1);
-        let workers = concurrency.min(tasks.len()).max(1);
+        let workers = worker_count(args.concurrency, tasks.len());
         if !args.quiet && !tasks.is_empty() && workers > 1 {
             eprintln!(
                 "Simulating {} functions concurrently (max {})...",
@@ -2170,6 +2260,7 @@ fn run() -> Result<i32> {
                     instructions,
                     read_bytes,
                     write_bytes,
+                    memory_bytes,
                     transaction_data_xdr,
                 }) => {
                     // Record the measurement for baseline/snapshot mode. This
@@ -2208,11 +2299,27 @@ fn run() -> Result<i32> {
                             pass,
                         });
                     }
+                    if let Some(memory_bytes) = memory_bytes {
+                        let metric = "Memory Bytes";
+                        let limit = func_config.and_then(|cfg| limit_for_metric(cfg, metric));
+                        let (entry_limit, pass) = evaluate_check(memory_bytes, limit);
+                        if pass == Some(false) {
+                            checks_failed = true;
+                        }
+                        reports.push(CostReport {
+                            package: contract.package_name.clone(),
+                            function: function.clone(),
+                            metric,
+                            value: Some(memory_bytes),
+                            limit: entry_limit,
+                            pass,
+                        });
+                    }
 
                     // -- Optional Stellar CLI validation --
                     // `--validate` shells out to `stellar xdr decode`, which
                     // replay mode cannot assume exists; skip it there.
-                    if args.validate && args.replay.is_none() {
+                    if should_validate(args.validate, &args.replay) {
                         let v_result = validate::validate_metrics(
                             &transaction_data_xdr,
                             instructions,
@@ -2368,6 +2475,56 @@ fn run() -> Result<i32> {
                 Error::Message(format!("failed to write HTML report to {html_path}: {e}"))
             })?;
         }
+        // Honour the requested stdout format even when nothing was measured:
+        // `--json` emits the versioned envelope (empty `snapshots`, or the
+        // `--check` failure stubs when present) instead of a zero-byte file,
+        // and `--csv` emits at least the header row. `--markdown` renders the
+        // header/footer shell. The HTML file above is unchanged.
+        if args.csv {
+            let mut csv_writer = csv::Writer::from_writer(std::io::stdout());
+            if args.check {
+                csv_writer
+                    .write_record(["package", "function", "metric", "value", "limit", "pass"])
+                    .context("Failed to write CSV header")?;
+                for report in &reports {
+                    let value_str = report.value.map(|val| val.to_string()).unwrap_or_default();
+                    let limit_str = report.limit.map(|lim| lim.to_string()).unwrap_or_default();
+                    let pass_str = report.pass.map(|p| p.to_string()).unwrap_or_default();
+                    csv_writer
+                        .write_record([
+                            report.package.as_str(),
+                            report.function.as_str(),
+                            report.metric,
+                            value_str.as_str(),
+                            limit_str.as_str(),
+                            pass_str.as_str(),
+                        ])
+                        .context("Failed to write CSV record")?;
+                }
+            } else {
+                csv_writer
+                    .write_record(["package", "function", "metric", "value"])
+                    .context("Failed to write CSV header")?;
+                for report in &reports {
+                    if report.value.is_some() {
+                        let value_str = report.value.map(|val| val.to_string()).unwrap_or_default();
+                        csv_writer
+                            .write_record([
+                                report.package.as_str(),
+                                report.function.as_str(),
+                                report.metric,
+                                value_str.as_str(),
+                            ])
+                            .context("Failed to write CSV record")?;
+                    }
+                }
+            }
+            csv_writer.flush().context("Failed to flush CSV writer")?;
+        } else if args.json {
+            println!("{}", json_output::render_json(&reports));
+        } else if args.markdown {
+            print!("{}", markdown::render_markdown(&reports));
+        }
         if !args.quiet {
             eprintln!("No successful simulations to report.");
         }
@@ -2375,7 +2532,8 @@ fn run() -> Result<i32> {
             return Ok(classify_outcome(
                 false,
                 args.check && checks_failed,
-                has_errors || validation_failed,
+                validation_failed,
+                has_errors,
             ));
         }
         return Ok(EXIT_SUCCESS);
@@ -2427,7 +2585,47 @@ fn run() -> Result<i32> {
             let render_opts = RenderOptions {
                 hide_unchanged: args.hide_unchanged,
             };
-            if args.json {
+            if args.csv {
+                let mut csv_writer = csv::Writer::from_writer(std::io::stdout());
+                csv_writer
+                    .write_record([
+                        "package",
+                        "function",
+                        "metric",
+                        "baseline",
+                        "current",
+                        "tolerance",
+                        "verdict",
+                    ])
+                    .context("Failed to write CSV header")?;
+                for func in &report.compared {
+                    for m in &func.metrics {
+                        if render_opts.hide_unchanged && m.is_unchanged() {
+                            continue;
+                        }
+                        let verdict = match m.verdict {
+                            compare::Verdict::Regression => "regression",
+                            compare::Verdict::Improvement => "improvement",
+                            compare::Verdict::Pass => "pass",
+                        };
+                        let baseline_str = m.baseline.to_string();
+                        let current_str = m.current.to_string();
+                        let tolerance_str = m.tolerance.value.to_string();
+                        csv_writer
+                            .write_record([
+                                func.package.as_str(),
+                                func.function.as_str(),
+                                m.metric.label(),
+                                baseline_str.as_str(),
+                                current_str.as_str(),
+                                tolerance_str.as_str(),
+                                verdict,
+                            ])
+                            .context("Failed to write CSV record")?;
+                    }
+                }
+                csv_writer.flush().context("Failed to flush CSV writer")?;
+            } else if args.json {
                 let json = render_check_report_json(&report, default_tolerance);
                 println!(
                     "{}",
@@ -2490,10 +2688,12 @@ fn run() -> Result<i32> {
     } else if args.json {
         println!("{}", json_output::render_json(&reports));
     } else if args.markdown {
+        // `--markdown` emits exactly one document — the GFM table — in every
+        // mode (this path and the `--from` file-read path above). The
+        // machine-readable dump is `--json`'s job; when both flags are given,
+        // `--json` takes priority and only JSON is printed (see the output
+        // precedence in docs/src/reference.md).
         print!("{}", markdown::render_markdown(&reports));
-        let json_output =
-            serde_json::to_string_pretty(&reports).context("Failed to serialize report to JSON")?;
-        println!("{}", json_output);
     } else if let Some(ref html_path) = args.html {
         let content = html_output::render_html(&reports, args.check);
         std::fs::write(html_path, &content).map_err(|e| {
@@ -2572,14 +2772,15 @@ fn run() -> Result<i32> {
         }
     }
     // PR #195: `--check` exits non-zero when any limit was breached so CI can
-    // gate on the result. Network/infrastructure failures (simulations that
-    // never produced metrics, `--validate` decode failures) also exit
-    // non-zero with their own code so a CI job can retry instead of treating
-    // them as a real budget/regression failure.
+    // gate on the result. Simulations that never produced metrics exit with
+    // the network/infrastructure code (retryable); deterministic `--validate`
+    // decode mismatches exit with the generic code (non-retryable, do not
+    // retry) so a CI job can tell them apart.
     Ok(classify_outcome(
         false,
         args.check && checks_failed,
-        has_errors || validation_failed,
+        validation_failed,
+        has_errors,
     ))
 }
 
@@ -2814,11 +3015,42 @@ mod tests {
         assert_eq!(meta["network"].as_str(), Some("testnet"));
         assert!(meta["protocol_version"].as_u64().is_some());
 
-        let (instructions, read_bytes, write_bytes) =
-            extract_metrics(&fixture_json).expect("extraction from fixture should succeed");
+        let (instructions, read_bytes, write_bytes, memory_bytes) =
+            extract_metrics_with_memory(&fixture_json)
+                .expect("extraction from fixture should succeed");
         assert_eq!(instructions, FIXTURE_INSTRUCTIONS);
         assert_eq!(read_bytes, FIXTURE_READ_BYTES);
         assert_eq!(write_bytes, FIXTURE_WRITE_BYTES);
+        assert_eq!(memory_bytes, Some(16_384));
+    }
+
+    #[test]
+    fn extract_metrics_accepts_integer_memory_bytes() {
+        let mut rpc_json = fixture_rpc_response_json();
+        rpc_json["result"]["cost"]["memBytes"] = serde_json::json!(16_384);
+
+        let (_, _, _, memory_bytes) =
+            extract_metrics_with_memory(&rpc_json).expect("integer memBytes should parse");
+        assert_eq!(memory_bytes, Some(16_384));
+    }
+
+    #[test]
+    fn extract_metrics_rejects_unparseable_memory_bytes() {
+        let mut rpc_json = fixture_rpc_response_json();
+        rpc_json["result"]["cost"]["memBytes"] = serde_json::json!("not-a-number");
+
+        assert!(
+            extract_metrics_with_memory(&rpc_json).is_err(),
+            "invalid memBytes must not become zero"
+        );
+    }
+
+    #[test]
+    fn extract_metrics_omits_missing_memory_bytes() {
+        let rpc_json = fixture_rpc_response_json();
+        let (_, _, _, memory_bytes) =
+            extract_metrics_with_memory(&rpc_json).expect("missing cost should be supported");
+        assert_eq!(memory_bytes, None);
     }
 
     #[test]
@@ -3789,12 +4021,14 @@ write_limit = 1000
         assert!(!color_enabled_with(Auto, false, false));
         assert!(!color_enabled_with(Auto, true, true));
         assert!(!color_enabled_with(Auto, true, false));
-        // Explicit colour still cannot override NO_COLOR or non-terminal
-        // suppression.
+        // Explicit colour still cannot override NO_COLOR suppression, but
+        // `Always` does force colour into pipes and files.
         assert!(!color_enabled_with(Always, true, false));
         assert!(!color_enabled_with(Always, true, true));
         assert!(color_enabled_with(Always, false, true));
+        assert!(color_enabled_with(Always, false, false));
         assert!(!color_enabled_with(Never, false, true));
+        assert!(!color_enabled_with(Never, false, false));
     }
 
     #[test]
@@ -4058,25 +4292,56 @@ write_limit = 1000
 
     #[test]
     fn classify_outcome_success_when_nothing_failed() {
-        assert_eq!(classify_outcome(false, false, false), EXIT_SUCCESS);
+        assert_eq!(classify_outcome(false, false, false, false), EXIT_SUCCESS);
     }
 
     #[test]
     fn classify_outcome_regression_takes_precedence() {
         // A regression is the strongest signal; it wins even when a budget
         // limit also failed and the network was flaky.
-        assert_eq!(classify_outcome(true, true, true), EXIT_REGRESSION);
+        assert_eq!(classify_outcome(true, true, true, true), EXIT_REGRESSION);
     }
 
     #[test]
     fn classify_outcome_budget_before_network() {
-        assert_eq!(classify_outcome(false, true, true), EXIT_BUDGET_EXCEEDED);
-        assert_eq!(classify_outcome(false, true, false), EXIT_BUDGET_EXCEEDED);
+        assert_eq!(
+            classify_outcome(false, true, false, true),
+            EXIT_BUDGET_EXCEEDED
+        );
+        assert_eq!(
+            classify_outcome(false, true, false, false),
+            EXIT_BUDGET_EXCEEDED
+        );
     }
 
     #[test]
     fn classify_outcome_network_only() {
-        assert_eq!(classify_outcome(false, false, true), EXIT_NETWORK_FAILURE);
+        assert_eq!(
+            classify_outcome(false, false, false, true),
+            EXIT_NETWORK_FAILURE
+        );
+    }
+
+    #[test]
+    fn classify_outcome_validation_mismatch_is_generic_not_network() {
+        // A deterministic `--validate` decode mismatch is reproducible, so
+        // retrying is pointless: it maps to the generic (non-retryable)
+        // code, never to the network code.
+        assert_eq!(
+            classify_outcome(false, false, true, false),
+            crate::error::EXIT_GENERIC_FAILURE
+        );
+        // ... and it still beats a simultaneous transient network fault.
+        assert_eq!(
+            classify_outcome(false, false, true, true),
+            crate::error::EXIT_GENERIC_FAILURE
+        );
+        // Budget and regression findings stay more actionable than it.
+        assert_eq!(
+            classify_outcome(false, true, true, true),
+            EXIT_BUDGET_EXCEEDED
+        );
+        assert_eq!(classify_outcome(true, false, true, true), EXIT_REGRESSION);
     }
 
     #[test]
@@ -4132,5 +4397,197 @@ write_limit = 1000
                 "1"
             ]
         );
+    }
+}
+
+/// Regression tests for issue #860: the `--derive-limits` help must spell
+/// the function-to-scenario mapping as `[scenarios.<name>]` (table of
+/// tables, matching `BudgetToml.scenarios: HashMap<_, _>`), not
+/// `[[scenarios.<name>]]` (array of tables, which fails deserialization).
+#[cfg(test)]
+mod derive_limits_help_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn derive_limits_help_uses_table_of_tables_syntax() {
+        let help = crate::cli::args::BudgetReportArgs::command()
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("[scenarios.<name>]"),
+            "help should document the [scenarios.<name>] syntax, got:\n{help}"
+        );
+        assert!(
+            !help.contains("[[scenarios."),
+            "help must not document the [[scenarios.]] array syntax, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn scenarios_table_of_tables_syntax_parses_into_budget_toml() {
+        // The exact shape the corrected help text describes: a
+        // `[scenarios.<name>]` table with package + functions. A user who
+        // copies it must not hit a serde error (the old `[[...]]` spelling
+        // exits with CONFIG_ERROR before any measurement).
+        let config: BudgetToml = toml::from_str(
+            "[scenarios.full_workflow]\n\
+             package = \"amm-pool-contract\"\n\
+             functions = [\"deposit\", \"swap\", \"withdraw\"]\n",
+        )
+        .expect("the documented [scenarios.<name>] syntax must parse");
+        let scenario = config
+            .scenarios
+            .get("full_workflow")
+            .expect("scenario should be present");
+        assert_eq!(scenario.package.as_deref(), Some("amm-pool-contract"));
+        assert_eq!(scenario.functions, vec!["deposit", "swap", "withdraw"]);
+    }
+}
+
+/// Regression tests for issue #861: `--replay` silently drops `--validate`.
+#[cfg(test)]
+mod validate_replay_tests {
+    use super::*;
+
+    #[test]
+    fn validate_runs_without_replay() {
+        assert!(should_validate(true, &None));
+    }
+
+    #[test]
+    fn replay_skips_validate_even_when_flag_is_present() {
+        assert!(!should_validate(true, &Some("fixture.json".to_string())));
+    }
+
+    #[test]
+    fn no_validate_flag_means_no_validation_regardless_of_replay() {
+        assert!(!should_validate(false, &None));
+        assert!(!should_validate(false, &Some("fixture.json".to_string())));
+    }
+}
+
+/// Regression tests for issue #862: `run_derive_mode` margin-resolution
+/// error branches.
+#[cfg(test)]
+mod derive_margin_tests {
+    use super::*;
+
+    fn full_cli() -> [Option<&'static str>; 4] {
+        [Some("1.5"), Some("1.5"), Some("1.5"), Some("1.5")]
+    }
+
+    #[test]
+    fn malformed_cli_margin_value_is_a_parse_error() {
+        let err = resolve_derive_margin(
+            Some("not-a-number"),
+            Some("1.5"),
+            Some("1.5"),
+            Some("1.5"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("invalid --margin-cpu"),
+            "should name the offending flag, got: {err}"
+        );
+    }
+
+    #[test]
+    fn partial_cli_margin_set_names_the_missing_flags() {
+        let err = resolve_derive_margin(Some("1.5"), Some("1.5"), None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CLI margin is partially set"), "got: {err}");
+        assert!(
+            err.contains("read") && err.contains("write"),
+            "should name the missing flags, got: {err}"
+        );
+        assert!(
+            !err.contains("\"cpu\"") && !err.contains("\"memory\""),
+            "supplied flags must not be listed as missing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn no_margin_at_all_is_an_error() {
+        let err = resolve_derive_margin(None, None, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no margin supplied"), "got: {err}");
+    }
+
+    #[test]
+    fn incomplete_toml_margin_without_cli_flags_is_an_error() {
+        let toml_margin = Some(MarginToml {
+            cpu_margin: Some(1.5),
+            memory_margin: None,
+            read_margin: None,
+            write_margin: None,
+        });
+        let err = resolve_derive_margin(None, None, None, None, toml_margin)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no margin supplied"),
+            "an incomplete [margin] table is the same error as no table, got: {err}"
+        );
+    }
+
+    #[test]
+    fn complete_cli_margin_set_resolves() {
+        let [cpu, memory, read, write] = full_cli();
+        let margin = resolve_derive_margin(cpu, memory, read, write, None)
+            .expect("a complete CLI set must resolve");
+        assert!((margin.cpu - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn complete_toml_margin_resolves_without_cli_flags() {
+        let toml_margin = Some(MarginToml {
+            cpu_margin: Some(1.25),
+            memory_margin: Some(1.5),
+            read_margin: Some(2.0),
+            write_margin: Some(1.1),
+        });
+        let margin = resolve_derive_margin(None, None, None, None, toml_margin)
+            .expect("a complete [margin] table must resolve");
+        assert!((margin.cpu - 1.25).abs() < f64::EPSILON);
+        assert!((margin.memory - 1.5).abs() < f64::EPSILON);
+    }
+}
+
+/// Regression tests for issue #863: the `--concurrency 0` runtime clamp.
+#[cfg(test)]
+mod worker_count_tests {
+    use super::*;
+
+    #[test]
+    fn zero_concurrency_clamps_to_one_worker() {
+        assert_eq!(worker_count(0, 5), 1);
+    }
+
+    #[test]
+    fn one_concurrency_stays_sequential() {
+        assert_eq!(worker_count(1, 5), 1);
+    }
+
+    #[test]
+    fn workers_never_exceed_the_task_count() {
+        assert_eq!(worker_count(8, 3), 3);
+        assert_eq!(worker_count(64, 2), 2);
+    }
+
+    #[test]
+    fn workers_match_concurrency_within_bounds() {
+        assert_eq!(worker_count(4, 4), 4);
+        assert_eq!(worker_count(2, 5), 2);
+    }
+
+    #[test]
+    fn worker_count_is_never_zero() {
+        assert_eq!(worker_count(0, 0), 1);
+        assert_eq!(worker_count(3, 0), 1);
     }
 }

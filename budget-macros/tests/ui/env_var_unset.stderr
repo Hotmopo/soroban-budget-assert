@@ -1,0 +1,7 @@
+error: env var `UI_TEST_UNSET_BUDGET` is not set at macro-expansion time
+ --> tests/ui/env_var_unset.rs:3:1
+  |
+3 | #[budget_cpu_lt(env = "UI_TEST_UNSET_BUDGET")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `budget_cpu_lt` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -54,6 +54,14 @@ fn pct_100_passes() {
     let _ = env.cost_estimate().budget().cpu_instruction_cost();
 }
 
+/// A 1% limit of the 50-unit small reference resolves to zero
+/// (`50 * 1 / 100 == 0`), so even a cost of 1 exceeds it.
+#[budget_cpu_lt(pct = 1, of = env_file = PCT_ENV_FILE, env = "PCT_TEST_SMALL_NETWORK")]
+fn pct_zero_limit_fails() {
+    let env = Env::new(1, 0);
+    let _ = env.cost_estimate().budget().cpu_instruction_cost();
+}
+
 /// Verify that percentage failures identify the measured cost, resolved limit,
 /// and percentage that produced the limit.
 fn assert_pct_failure<F, R>(case: &str, expected_cost: u64, expected_limit: u64, pct: u64, f: F)
@@ -89,6 +97,7 @@ fn run_passing_cases() {
 fn run_failing_cases() {
     assert_pct_failure("over quarter limit", 2_501, 2_500, 25, pct_fails_when_over);
     assert_pct_failure("at quarter limit", 2_500, 2_500, 25, pct_fails_at_limit);
+    assert_pct_failure("1% of 50 resolves to zero", 1, 0, 1, pct_zero_limit_fails);
 }
 
 fn main() {

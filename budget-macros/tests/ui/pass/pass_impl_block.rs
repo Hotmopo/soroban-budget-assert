@@ -55,12 +55,10 @@ impl Contract {
         let _ = env.cost_estimate().budget().cpu_instruction_cost();
     }
 
-    // A method may deliberately opt out by shadowing the injected resolver so
-    // it returns no limit. The cost is one below u64::MAX to pin the strict
-    // comparison without relying on inherited process environment state.
-    #[budget_cpu_lt(env = "PASS_IMPL_BLOCK_UNSET_LIMIT")]
+    // A deliberately high limit keeps this method effectively unbudgeted
+    // without relying on inherited process environment state.
+    #[budget_cpu_lt(18446744073709551615)]
     fn deliberately_unbudgeted() {
-        let budget_env_resolve = |_var: &str| -> Option<String> { None };
         let env = Env::new(u64::MAX - 1, 0);
         let _ = env.cost_estimate().budget().cpu_instruction_cost();
     }

@@ -1,0 +1,7 @@
+error: unexpected end of input, missing required field `tolerance`
+ --> tests/ui/scaling_missing_tolerance.rs:6:1
+  |
+6 | #[budget_scaling(sizes = [10, 100], model = linear)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `budget_scaling` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -287,9 +287,9 @@ fn operation_scales_linearly(env: Env, size: u32) {
 
 | Field       | Type              | Description |
 |-------------|-------------------|-------------|
-| `sizes`     | `[u32; N]` (N≥2) | Input sizes to measure. |
+| `sizes`     | `[u32; N]` (N≥2, distinct, strictly positive, ascending) | Input sizes to measure. |
 | `model`     | `linear` / `quadratic` | Expected growth model. |
-| `tolerance` | `f64`             | Max allowed relative deviation (e.g. `0.3` = 30%). |
+| `tolerance` | `f64` (finite, ≥ 0; `0.0` means the observed ratio must match exactly) | Max allowed relative deviation (e.g. `0.3` = 30%). |
 
 **How it works:**
 
@@ -451,9 +451,9 @@ This section is the **complete** flag reference: every `#[arg(...)]` field decla
 | `--network <NETWORK>` | `network` | none — required from one source | Network to deploy and invoke against, e.g. `testnet` (passed straight through to the `stellar` CLI). CLI flag wins over the file; missing from both is a fatal error naming the field. **Does not** actually change what the simulate step targets — see [the discrepancy note](#--network-does-not-actually-route-the-simulate-step) below. |
 | `--source <SOURCE>` | `source` | none — required from one source | Funded Stellar identity used for deploy fees and as the simulation source. Same precedence as `--network`. |
 | `--json` | — | `false` | Emit the report as pretty-printed JSON instead of a table. Composes with `--check` (adds `limit`/`pass` per entry) and with `--record-baseline`/`--check-baseline` (see [Output-format precedence](#output-format-precedence-when-flags-combine)). |
-| `--csv` | — | `false` | Emit the report as CSV instead of a table. Header is `package,function,metric,value` normally, or `package,function,metric,value,limit,pass` under `--check`. Rows whose `value` never simulated are only included in `--check` mode (they carry `pass=false`); in the non-`--check` CSV they are omitted entirely, unlike the JSON/table output, which lists them. Takes priority over `--json`/`--html` if more than one is passed — see [below](#output-format-precedence-when-flags-combine). |
+| `--csv` | — | `false` | Emit the report as CSV instead of a table. Header is `package,function,metric,value` normally, or `package,function,metric,value,limit,pass` under `--check`. Under `--check-baseline` the header is `package,function,metric,baseline,current,tolerance,verdict` (one row per compared metric; `verdict` is `regression`, `improvement`, or `pass`, and `--hide-unchanged` drops unchanged rows from the CSV as it does for the text/markdown renderers). Rows whose `value` never simulated are only included in `--check` mode (they carry `pass=false`); in the non-`--check` CSV they are omitted entirely, unlike the JSON/table output, which lists them. Takes priority over `--json`/`--html` if more than one is passed — see [below](#output-format-precedence-when-flags-combine). |
 | `--html` | — | `false` | Emit the report as a single self-contained HTML page — no external CSS, scripts, or fonts, so it renders from a `file://` URL and from a downloaded CI artifact. Rows mirror the JSON output; with `--check` each row also shows its limit and pass/fail status. |
-| `--markdown` | — | `false` | Emit the report as a GitHub-Flavored Markdown table suitable for appending to `$GITHUB_STEP_SUMMARY`. Numeric values are comma-formatted; unavailable metrics (e.g. network-only Read/Write Bytes) render as `N/A (testnet required)`. When used with an explicit `--from <PATH>` (or `--from -` for stdin), reads an existing JSON report file instead of running a live simulation — this is the mode the CI workflow uses to render the step summary from `current_report.json`. Without `--from`, runs a live simulation even if `current_report.json` exists in the working directory and never auto-reads it. |
+| `--markdown` | — | `false` | Emit the report as a GitHub-Flavored Markdown table suitable for appending to `$GITHUB_STEP_SUMMARY`. Columns are `Package`, `Function`, `Metric`, `Value`; when the report carries `--check` metadata (a `limit`/`pass` on any row) it gains `Limit` and `Status` (`PASS`/`FAIL`) columns. Numeric values are comma-formatted; a metric with no measured value renders as `N/A (testnet required)` in a plain report, or `N/A (simulation failed)` on a failed-check stub row (whose `Status` is `FAIL`). `--markdown` emits exactly one document — the table — in every mode (live run and `--from`); the machine-readable report stays behind `--json`, which wins if both flags are passed. When used with `--from <PATH>`, reads an existing JSON report file instead of running a live simulation — this is the mode the CI workflow uses to render the step summary from `current_report.json`. |
 | `--check` | — | `false` | Compare measured metrics against `cpu_limit` / `read_limit` / `write_limit` declared per function in `budget.toml`; print a per-function+metric pass/fail line and exit non-zero on any breach or failed configured simulation. See [`--check`: enforcing regression limits](#--check-enforcing-regression-limits-against-network-verified-costs). |
 | `--color <auto\|always\|never>` | — | `auto` | When to colourise the plain-text `--check` report. Only meaningful together with `--check` — there is nothing to colourise otherwise, and callers gate on `args.check` before consulting it. See [the discrepancy note](#-color-does-not-actually-force-colour-into-a-pipe) below: `--color always` does **not**, despite its help text, force colour into a non-terminal output. |
 | `--quiet` | — | `false` | Suppress non-essential progress messages and warnings on stderr (build/deploy/simulate progress, retry notices). The final report is still printed to stdout; fatal errors (spawn failures, hard build failures) still go to stderr regardless. |
@@ -1274,8 +1274,10 @@ Read bytes cost (memory proxy) {marginal} exceeded limit {N} (marginal: {measure
 | `#[budget_mem_lt(N)]` | Memory bytes | `Memory bytes cost` | Yes |
 | `#[budget_write_bytes_lt(N)]` | Write bytes (memory proxy) | `Write bytes cost (memory proxy)` | Yes |
 | `#[budget_read_bytes_lt(N)]` | Read bytes (memory proxy) | `Read bytes cost (memory proxy)` | Yes |
+| `#[budget_events_lt(N)]` | Events emitted | `Event count` | Yes |
+| `#[budget_ledger_entries_lt(N)]` | Ledger entries (reads + writes) | `Ledger entry count` | Yes |
 | `#[budget_lt(N)]` | Both CPU + memory | `CPU instruction cost` or `Memory bytes cost` | Yes |
-| `#[budget_scaling(...)]` | CPU growth model | `{fn} scaling: {model}` | N/A |
+| `#[budget_scaling(...)]` | CPU growth model | `Scaling check failed at size {__curr_s}` | N/A |
 
 All macros accept the same limit sources: integer literal, `env = "VAR"`,
 `env_file = "PATH", env = "VAR"`, or `config = "key"`. The `baseline` parameter

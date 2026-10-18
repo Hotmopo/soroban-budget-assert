@@ -55,6 +55,11 @@ fn fixture_and_snapshot(name: &str) -> (String, String) {
 
 #[test]
 fn ui_tests() {
+    std::env::set_var("UI_TEST_INVALID_BUDGET", "not-a-u64");
+    std::env::set_var("UI_TEST_MAX_CPU", "1000");
+    std::env::set_var("UI_TEST_MAX_CPU_EXCEEDED", "1000");
+    std::env::set_var("UI_TEST_MAX_CPU_UNPARSABLE", "1000");
+    std::env::set_var("UI_TEST_MAX_CPU_WHITESPACE", "1000");
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/*.rs");
     t.pass("tests/ui/pass/*.rs");
@@ -103,6 +108,36 @@ fn every_pass_fixture_is_a_standalone_program() {
     }
 }
 
+/// Issue #859: the event and ledger-entry macros must have pass fixtures that
+/// *exercise the expansion*, not just fixtures that reject bad arguments.
+///
+/// trybuild's `pass` mode builds each fixture and then runs it, so the
+/// assertions in `run_passing_cases` / `run_failing_cases` are the only place
+/// where a real breach of either macro is observed. These checks keep that
+/// property from eroding: each fixture must still invoke its macro, return a
+/// `main`, drive a panic through `budget_panic`, and assert on the message
+/// text the macro is documented to produce.
+#[test]
+fn event_and_ledger_macros_have_behavioural_pass_fixtures() {
+    let pass_dir = ui_dir().join("pass");
+    for (fixture, macro_name, expected_message) in [
+        ("pass_events.rs", "#[budget_events_lt", "Event count"),
+        (
+            "pass_ledger_entries.rs",
+            "#[budget_ledger_entries_lt",
+            "Ledger entry count (read: ",
+        ),
+    ] {
+        let source = read(&pass_dir.join(fixture));
+        for needle in [macro_name, "fn main", "budget_panic", expected_message] {
+            assert!(
+                source.contains(needle),
+                "{fixture}: must contain {needle:?} so the macro is expanded into code that runs"
+            );
+        }
+    }
+}
+
 /// Issue #627: `budget_read_bytes_lt` must reject a body with no `env` source.
 #[test]
 fn missing_env_read_fixture_pins_the_missing_env_error() {
@@ -116,6 +151,87 @@ fn missing_env_read_fixture_pins_the_missing_env_error() {
     assert!(!source.contains("env_file"), "must omit an env_file source");
     assert!(
         snapshot.contains("budget_read_bytes_lt"),
+        "diagnostic must name the macro"
+    );
+    assert!(
+        snapshot.contains("E0423"),
+        "expected rustc's E0423 for a missing env"
+    );
+}
+
+/// Issue #874: `budget_write_bytes_lt` must reject a body with no `env` source.
+#[test]
+fn missing_env_write_fixture_pins_the_missing_env_error() {
+    let (source, snapshot) = fixture_and_snapshot("missing_env_write.rs");
+
+    assert!(
+        source.contains("budget_write_bytes_lt"),
+        "must use the write-bytes macro"
+    );
+    assert!(!source.contains("env ="), "must omit the env source");
+    assert!(!source.contains("env_file"), "must omit an env_file source");
+    assert!(
+        snapshot.contains("budget_write_bytes_lt"),
+        "diagnostic must name the macro"
+    );
+    assert!(
+        snapshot.contains("E0423"),
+        "expected rustc's E0423 for a missing env"
+    );
+}
+
+/// Issue #874: `budget_events_lt` must reject a body with no `env` source.
+#[test]
+fn missing_env_events_fixture_pins_the_missing_env_error() {
+    let (source, snapshot) = fixture_and_snapshot("missing_env_events.rs");
+
+    assert!(
+        source.contains("budget_events_lt"),
+        "must use the events macro"
+    );
+    assert!(!source.contains("env ="), "must omit the env source");
+    assert!(!source.contains("env_file"), "must omit an env_file source");
+    assert!(
+        snapshot.contains("budget_events_lt"),
+        "diagnostic must name the macro"
+    );
+    assert!(
+        snapshot.contains("E0423"),
+        "expected rustc's E0423 for a missing env"
+    );
+}
+
+/// Issue #874: `budget_ledger_entries_lt` must reject a body with no `env` source.
+#[test]
+fn missing_env_ledger_fixture_pins_the_missing_env_error() {
+    let (source, snapshot) = fixture_and_snapshot("missing_env_ledger.rs");
+
+    assert!(
+        source.contains("budget_ledger_entries_lt"),
+        "must use the ledger-entries macro"
+    );
+    assert!(!source.contains("env ="), "must omit the env source");
+    assert!(!source.contains("env_file"), "must omit an env_file source");
+    assert!(
+        snapshot.contains("budget_ledger_entries_lt"),
+        "diagnostic must name the macro"
+    );
+    assert!(
+        snapshot.contains("E0423"),
+        "expected rustc's E0423 for a missing env"
+    );
+}
+
+/// Issue #874: `budget_lt` must reject a body with no `env` source.
+#[test]
+fn missing_env_budget_lt_fixture_pins_the_missing_env_error() {
+    let (source, snapshot) = fixture_and_snapshot("missing_env_budget_lt.rs");
+
+    assert!(source.contains("budget_lt"), "must use the budget_lt macro");
+    assert!(!source.contains("env ="), "must omit the env source");
+    assert!(!source.contains("env_file"), "must omit an env_file source");
+    assert!(
+        snapshot.contains("budget_lt"),
         "diagnostic must name the macro"
     );
     assert!(

@@ -15,6 +15,7 @@
 //!   producing pass/fail outcomes for regression detection.
 //! * **Reporting** — Aggregating per-function metrics into a structured format
 //!   suitable for table, JSON, or CSV output.
+
 //!
 //! ## Trait Overview
 //!
@@ -88,6 +89,19 @@
 //! ```
 
 use std::fmt;
+
+pub const METRIC_CPU_INSTRUCTIONS: &str = "CPU Instructions";
+pub const METRIC_READ_BYTES: &str = "Read Bytes";
+pub const METRIC_WRITE_BYTES: &str = "Write Bytes";
+pub const METRIC_MEMORY_BYTES: &str = "Memory Bytes";
+pub const METRIC_WASM_BYTES: &str = "WASM Bytes";
+pub const METRIC_NAMES: &[&str] = &[
+    METRIC_CPU_INSTRUCTIONS,
+    METRIC_READ_BYTES,
+    METRIC_WRITE_BYTES,
+    METRIC_MEMORY_BYTES,
+    METRIC_WASM_BYTES,
+];
 
 // ---------------------------------------------------------------------------
 // CostMeasurer trait
@@ -180,9 +194,11 @@ pub trait CostMeasurer {
     /// ```
     fn value_for(&self, metric: &str) -> Option<u64> {
         match metric {
-            "CPU Instructions" => Some(self.cpu_instructions()),
-            "Read Bytes" | "Write Bytes" => Some(self.memory_bytes()),
-            "WASM Bytes" => Some(0),
+            METRIC_CPU_INSTRUCTIONS => Some(self.cpu_instructions()),
+            METRIC_READ_BYTES | METRIC_WRITE_BYTES | METRIC_MEMORY_BYTES => {
+                Some(self.memory_bytes())
+            }
+            METRIC_WASM_BYTES => Some(0),
             _ => None,
         }
     }
@@ -260,7 +276,7 @@ pub trait BudgetAssert: CostMeasurer {
         if actual < limit {
             Ok(())
         } else {
-            Err(BudgetExceededError::new("CPU Instructions", actual, limit).into())
+            Err(BudgetExceededError::new(METRIC_CPU_INSTRUCTIONS, actual, limit).into())
         }
     }
 
@@ -290,7 +306,7 @@ pub trait BudgetAssert: CostMeasurer {
         if actual < limit {
             Ok(())
         } else {
-            Err(BudgetExceededError::new("Memory Bytes", actual, limit).into())
+            Err(BudgetExceededError::new(METRIC_MEMORY_BYTES, actual, limit).into())
         }
     }
 
@@ -545,10 +561,31 @@ mod tests {
                 200
             }
         }
-        assert_eq!(Dummy.value_for("CPU Instructions"), Some(99));
-        assert_eq!(Dummy.value_for("Read Bytes"), Some(200));
-        assert_eq!(Dummy.value_for("Write Bytes"), Some(200));
-        assert_eq!(Dummy.value_for("WASM Bytes"), Some(0));
+        assert_eq!(Dummy.value_for(METRIC_CPU_INSTRUCTIONS), Some(99));
+        assert_eq!(Dummy.value_for(METRIC_READ_BYTES), Some(200));
+        assert_eq!(Dummy.value_for(METRIC_WRITE_BYTES), Some(200));
+        assert_eq!(Dummy.value_for(METRIC_MEMORY_BYTES), Some(200));
+        assert_eq!(Dummy.value_for(METRIC_WASM_BYTES), Some(0));
+    }
+
+    #[test]
+    fn every_metric_name_is_resolvable() {
+        struct Dummy;
+        impl CostMeasurer for Dummy {
+            fn cpu_instructions(&self) -> u64 {
+                99
+            }
+            fn memory_bytes(&self) -> u64 {
+                200
+            }
+        }
+
+        for metric in METRIC_NAMES {
+            assert!(
+                Dummy.value_for(metric).is_some(),
+                "metric name {metric:?} is not resolvable"
+            );
+        }
     }
 
     #[test]

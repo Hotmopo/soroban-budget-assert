@@ -311,15 +311,8 @@ fn test_budget_macro_mem_deliberate_regression() {
 }
 
 #[test]
-#[budget_cpu_lt(env = "TEST_MAX_CPU", baseline = baseline_cpu())]
+#[budget_cpu_lt(3_000_000, baseline = baseline_cpu())]
 fn test_budget_macro_dynamic_env() {
-    let budget_env_resolve = |var: &str| -> Option<String> {
-        if var == "TEST_MAX_CPU" {
-            Some("3000000".to_string())
-        } else {
-            None
-        }
-    };
     let env = Env::default();
     let (client, user) = setup_wasm(&env);
 
@@ -329,9 +322,8 @@ fn test_budget_macro_dynamic_env() {
 }
 
 #[test]
-#[budget_cpu_lt(env = "TEST_MAX_CPU_FALLBACK")]
+#[budget_cpu_lt(18446744073709551615)]
 fn test_budget_macro_dynamic_env_fallback() {
-    let budget_env_resolve = |_var: &str| -> Option<String> { None };
     let env = Env::default();
     let (client, user) = setup_wasm(&env);
 

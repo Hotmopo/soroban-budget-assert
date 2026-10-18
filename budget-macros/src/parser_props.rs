@@ -22,7 +22,7 @@
 //! diagnostics + ui tests), not here. Findings from the initial run are
 //! listed in the PR description.
 
-use crate::{BudgetLimit, BudgetSpec, ScalingConfig, StandaloneSpec};
+use crate::{generate_limit_expr, BudgetLimit, BudgetSpec, ScalingConfig, StandaloneSpec};
 use proptest::prelude::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use syn::parse::Parse;
@@ -35,6 +35,22 @@ fn parses_without_panic<T: Parse>(src: &str) -> bool {
         match src.parse::<proc_macro2::TokenStream>() {
             Ok(tokens) => syn::parse2::<T>(tokens).is_ok(),
             Err(_) => false,
+        }
+    }));
+    match outcome {
+        Ok(parsed) => parsed,
+        Err(_) => panic!("parser panicked on input: {src:?}"),
+    }
+}
+
+/// Parse `src` as `T` without letting a panic escape, returning the parsed
+/// value or `None` when the parser rejected `src`. Used by properties that
+/// assert something about the *shape* of a successfully parsed value.
+fn try_parse<T: Parse>(src: &str) -> Option<T> {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        match src.parse::<proc_macro2::TokenStream>() {
+            Ok(tokens) => syn::parse2::<T>(tokens).ok(),
+            Err(_) => None,
         }
     }));
     match outcome {
@@ -198,20 +214,56 @@ proptest! {
         let _ = parses_without_panic::<BudgetSpec>(&src);
     }
 
+    /// Parsing never panics **and** anything that does parse satisfies the
+    /// parser's declared invariants: `sizes` carries at least two elements
+    /// (the ratio comparison needs a pair) and `tolerance` is finite. The
+    /// previous form discarded the parse result, so it asserted only that the
+    /// generator produced text the parser could accept or reject without
+    /// unwinding — nothing about the config it produced.
     #[test]
-    fn scaling_config_never_panics(src in scaling_config_src()) {
-        let _ = parses_without_panic::<ScalingConfig>(&src);
+    fn scaling_config_parses_only_with_a_usable_shape(src in scaling_config_src()) {
+        if let Some(config) = try_parse::<ScalingConfig>(&src) {
+            prop_assert!(
+                config.sizes.len() >= 2,
+                "a parsed scaling config must carry at least two sizes, got {:?}",
+                config.sizes
+            );
+            prop_assert!(
+                config.tolerance.is_finite(),
+                "a parsed tolerance must be finite, got {}",
+                config.tolerance
+            );
+        }
     }
 
     /// Round-trip: a `BudgetLimit` that parses from a bare integer re-emits
-    /// as the same integer and re-parses to the same value.
+    /// the same integer through the emitter the expansion path uses, and
+    /// re-parsing the emitted tokens yields an equal value.
+    ///
+    /// `BudgetLimit` does **not** implement `ToTokens` — every limit reaches
+    /// the generated code through [`generate_limit_expr`], and nothing in the
+    /// crate interpolates a `BudgetLimit` into a `quote!` — so the round trip
+    /// goes through that emitter. Perturbing its `Int` arm to emit a different
+    /// integer makes this property fail.
     #[test]
     fn int_budget_limit_round_trips(n in any::<u64>()) {
         let src = n.to_string();
         let first = syn::parse_str::<BudgetLimit>(&src);
         prop_assume!(first.is_ok());
-        let reparsed = syn::parse_str::<BudgetLimit>(&n.to_string());
-        prop_assert!(reparsed.is_ok());
+        let first = first.expect("checked by prop_assume above");
+
+        let emitted = generate_limit_expr(&first, "budget_limit_round_trips");
+        let reparsed = syn::parse2::<BudgetLimit>(emitted);
+        prop_assert!(
+            reparsed.is_ok(),
+            "the emitted limit must re-parse: {:?}",
+            reparsed.err()
+        );
+
+        match reparsed.expect("checked by prop_assert above") {
+            BudgetLimit::Int(value) => prop_assert_eq!(value, n),
+            _ => prop_assert!(false, "re-parsed to a non-integer variant"),
+        }
     }
 }
 

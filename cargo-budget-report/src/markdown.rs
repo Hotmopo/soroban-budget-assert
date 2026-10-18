@@ -5,11 +5,28 @@ const HEADER: &str = "# Workspace Budget Report (Tier A Local Measurements)\n\n\
 | Package | Function | Metric | Value |\n\
 |---|---|---|---:|\n";
 
+/// Header used when the reports carry `--check` metadata (`limit`/`pass`).
+const CHECK_HEADER: &str = "# Workspace Budget Report (Tier A Local Measurements)\n\n\
+| Package | Function | Metric | Value | Limit | Status |\n\
+|---|---|---|---:|---:|---|\n";
+
 const FOOTER: &str = "\n---\n\
 _Simulated resource amounts from local WASM test harness. Network-dependent billing metrics (Read/Write Bytes) require testnet simulation._\n";
 
-/// Cell text for a metric that has no measured value.
+/// Cell text for a metric that has no measured value in a report without check
+/// metadata: the metric was not produced, typically because it can only be
+/// measured against a live network.
 const NOT_MEASURED: &str = "N/A (testnet required)";
+
+/// Cell text for a failed-check stub row: the simulation produced no value, so
+/// there is nothing to compare against the limit. Rendered distinctly from
+/// [`NOT_MEASURED`] so a limit breach is never presented as a missing testnet
+/// measurement.
+const NOT_MEASURED_CHECK: &str = "N/A (simulation failed)";
+
+/// Cell text for a check column that does not apply to this row (no limit
+/// configured, or no pass/fail recorded).
+const NOT_APPLICABLE: &str = "-";
 
 /// Typical bytes a row adds beyond its package and function names: the four
 /// column separators, a metric name (at most `CPU Instructions`), a value of up
@@ -17,19 +34,49 @@ const NOT_MEASURED: &str = "N/A (testnet required)";
 /// underestimate merely costs one regrowth.
 const ROW_OVERHEAD: usize = 48;
 
+/// Additional bytes a check row adds over [`ROW_OVERHEAD`]: two column
+/// separators, a `u64` limit (at most 20 digits plus separators), and a
+/// `PASS`/`FAIL` status cell.
+const CHECK_ROW_OVERHEAD: usize = 40;
+
 /// Renders a slice of [`CostReport`] entries into a GitHub-Flavored Markdown table
 /// suitable for appending to `$GITHUB_STEP_SUMMARY`.
+///
+/// The table has four columns — `Package`, `Function`, `Metric`, `Value` — and
+/// gains two more (`Limit`, `Status`) whenever the reports carry check
+/// metadata, i.e. any entry has a `limit` or `pass` recorded by `--check`.
+/// Detecting this from the data (rather than requiring a caller flag) is what
+/// lets the `--markdown --from current_report.json` path used for the CI step
+/// summary show breach status even when the rendering command does not itself
+/// pass `--check`.
+///
+/// A row whose `value` is `None` renders as `N/A (testnet required)` without
+/// check metadata. With check metadata the same row is a failed-simulation
+/// stub and renders as `N/A (simulation failed)` in the value column, with the
+/// configured limit and `FAIL` in the check columns — so a breach is never
+/// shown as a missing network measurement.
 ///
 /// The output is built in a single buffer sized up front: rows are appended with
 /// `push_str` and values are formatted in place, so rendering allocates once
 /// (plus a regrowth if the estimate is short) instead of once or twice per row.
 pub(crate) fn render_markdown(reports: &[CostReport]) -> String {
+    // `--check` populates `limit`/`pass`; the plain report leaves both `None`.
+    let check = reports
+        .iter()
+        .any(|r| r.limit.is_some() || r.pass.is_some());
+
+    let row_overhead = if check {
+        CHECK_ROW_OVERHEAD
+    } else {
+        ROW_OVERHEAD
+    };
     let rows_len: usize = reports
         .iter()
-        .map(|r| r.package.len() + r.function.len() + ROW_OVERHEAD)
+        .map(|r| r.package.len() + r.function.len() + row_overhead)
         .sum();
-    let mut out = String::with_capacity(HEADER.len() + rows_len + FOOTER.len());
-    out.push_str(HEADER);
+    let header = if check { CHECK_HEADER } else { HEADER };
+    let mut out = String::with_capacity(header.len() + rows_len + FOOTER.len());
+    out.push_str(header);
 
     for r in reports {
         out.push_str("| ");
@@ -40,8 +87,22 @@ pub(crate) fn render_markdown(reports: &[CostReport]) -> String {
         out.push_str(r.metric);
         out.push_str(" | ");
         match r.value {
-            Some(v) => push_with_commas(&mut out, v),
+            Some(v) => push_with_commas(&mut out, u64::from(v)),
+            None if check => out.push_str(NOT_MEASURED_CHECK),
             None => out.push_str(NOT_MEASURED),
+        }
+        if check {
+            out.push_str(" | ");
+            match r.limit {
+                Some(limit) => push_with_commas(&mut out, limit),
+                None => out.push_str(NOT_APPLICABLE),
+            }
+            out.push_str(" | ");
+            out.push_str(match r.pass {
+                Some(true) => "PASS",
+                Some(false) => "FAIL",
+                None => NOT_APPLICABLE,
+            });
         }
         out.push_str(" |\n");
     }
@@ -53,12 +114,12 @@ pub(crate) fn render_markdown(reports: &[CostReport]) -> String {
 /// Appends `n` in decimal with a comma between each group of three digits
 /// (`2654615` becomes `2,654,615`), without allocating.
 ///
-/// The number is split into base-1000 groups, least significant first. A `u32`
-/// has at most ten digits, so four groups always suffice. The leading group is
-/// written as-is; every later group is zero-padded to three digits so that
+/// The number is split into base-1000 groups, least significant first. A `u64`
+/// has at most twenty digits, so seven groups always suffice. The leading group
+/// is written as-is; every later group is zero-padded to three digits so that
 /// `1_000_001` renders as `1,000,001` and not `1,0,1`.
-fn push_with_commas(out: &mut String, n: u32) {
-    let mut groups = [0u16; 4];
+fn push_with_commas(out: &mut String, n: u64) {
+    let mut groups = [0u16; 7];
     let mut count = 0;
     let mut rest = n;
     loop {
@@ -128,6 +189,24 @@ mod tests {
         }
     }
 
+    fn checked_report(
+        package: &str,
+        function: &str,
+        metric: &'static str,
+        value: Option<u32>,
+        limit: Option<u64>,
+        pass: Option<bool>,
+    ) -> CostReport {
+        CostReport {
+            package: package.to_string(),
+            function: function.to_string(),
+            metric,
+            value,
+            limit,
+            pass,
+        }
+    }
+
     /// The pre-optimization implementation, kept verbatim as the oracle the
     /// allocation-free version must match byte for byte.
     fn reference_format_number(n: u32) -> String {
@@ -145,7 +224,7 @@ mod tests {
 
     fn commas(n: u32) -> String {
         let mut out = String::new();
-        push_with_commas(&mut out, n);
+        push_with_commas(&mut out, u64::from(n));
         out
     }
 
@@ -194,6 +273,13 @@ mod tests {
     }
 
     #[test]
+    fn push_with_commas_handles_full_u64_range() {
+        let mut out = String::new();
+        push_with_commas(&mut out, u64::MAX);
+        assert_eq!(out, "18,446,744,073,709,551,615");
+    }
+
+    #[test]
     fn render_markdown_empty_input_is_header_and_footer_only() {
         assert_eq!(render_markdown(&[]), format!("{HEADER}{FOOTER}"));
     }
@@ -232,5 +318,112 @@ _Simulated resource amounts from local WASM test harness. Network-dependent bill
         // Behaviour preserved from the original: names are emitted verbatim.
         let md = render_markdown(&[report("a|b", "c d", "CPU Instructions", Some(1))]);
         assert!(md.contains("| a|b | c d | CPU Instructions | 1 |\n"));
+    }
+
+    #[test]
+    fn render_markdown_omits_check_columns_without_metadata() {
+        let md = render_markdown(&[report("pkg", "fn_a", "CPU Instructions", Some(1))]);
+        assert!(
+            md.contains("| Package | Function | Metric | Value |"),
+            "{md}"
+        );
+        assert!(
+            !md.contains("| Limit |"),
+            "no check columns without metadata"
+        );
+        assert!(!md.contains("PASS") && !md.contains("FAIL"), "{md}");
+    }
+
+    #[test]
+    fn render_markdown_check_metadata_adds_limit_and_status_columns() {
+        let md = render_markdown(&[checked_report(
+            "pkg",
+            "fn_a",
+            "CPU Instructions",
+            Some(1_234_567),
+            Some(5_000_000),
+            Some(true),
+        )]);
+        assert!(
+            md.contains("| Package | Function | Metric | Value | Limit | Status |"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| pkg | fn_a | CPU Instructions | 1,234,567 | 5,000,000 | PASS |"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_pass_false_differs_from_pass_none() {
+        let failing = render_markdown(&[checked_report(
+            "pkg",
+            "fn_a",
+            "Write Bytes",
+            Some(4_096),
+            Some(1_000),
+            Some(false),
+        )]);
+        let unmeasured = render_markdown(&[checked_report(
+            "pkg",
+            "fn_a",
+            "Write Bytes",
+            Some(4_096),
+            Some(1_000),
+            None,
+        )]);
+
+        assert!(failing.contains("| FAIL |"), "{failing}");
+        assert!(!unmeasured.contains("| FAIL |"), "{unmeasured}");
+        assert!(
+            failing.contains("| pkg | fn_a | Write Bytes | 4,096 | 1,000 | FAIL |"),
+            "{failing}"
+        );
+        assert!(
+            unmeasured.contains("| pkg | fn_a | Write Bytes | 4,096 | 1,000 | - |"),
+            "{unmeasured}"
+        );
+        assert_ne!(failing, unmeasured);
+    }
+
+    #[test]
+    fn render_markdown_stub_row_is_not_reported_as_a_testnet_gap() {
+        // A stub emitted by `emit_check_failure_entries`: no value, a breached
+        // limit, `pass: false`. It must not read as "N/A (testnet required)".
+        let md = render_markdown(&[checked_report(
+            "pkg",
+            "broken_sim",
+            "CPU Instructions",
+            None,
+            Some(5_000_000),
+            Some(false),
+        )]);
+        assert!(md.contains("N/A (simulation failed)"), "{md}");
+        assert!(
+            !md.contains("N/A (testnet required)"),
+            "a failed-check stub must not read as a missing testnet measurement: {md}"
+        );
+        assert!(
+            md.contains("| pkg | broken_sim | CPU Instructions | N/A (simulation failed) | 5,000,000 | FAIL |"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_stub_without_limit_still_shows_failure() {
+        // `emit_check_failure_entries` also stubs metrics with no configured
+        // limit (`limit: None`); the row must still be visible as failed.
+        let md = render_markdown(&[checked_report(
+            "pkg",
+            "broken_sim",
+            "Read Bytes",
+            None,
+            None,
+            Some(false),
+        )]);
+        assert!(
+            md.contains("| pkg | broken_sim | Read Bytes | N/A (simulation failed) | - | FAIL |"),
+            "{md}"
+        );
     }
 }

@@ -8,6 +8,9 @@ use std::process::{Command, Stdio};
 /// Default Soroban RPC endpoint used for `simulateTransaction` when no
 /// `--rpc-url` override is supplied.
 pub const DEFAULT_RPC_URL: &str = "https://soroban-testnet.stellar.org:443";
+pub const FUTURENET_RPC_URL: &str = "https://rpc-futurenet.stellar.org:443";
+pub const MAINNET_RPC_URL: &str = "https://soroban.stellar.org:443";
+pub const LOCAL_RPC_URL: &str = "http://localhost:8000/soroban/rpc";
 
 /// A custom network target for local / standalone RPC nodes (#49).
 ///
@@ -36,6 +39,7 @@ pub struct LiveTransport {
     retry_config: crate::RetryConfig,
     quiet: bool,
     net_override: Option<NetworkOverride>,
+    network: Option<String>,
 }
 
 fn run_stellar_command(args: &[String], operation: &str) -> Result<String, crate::RetryFailure> {
@@ -117,6 +121,7 @@ impl LiveTransport {
             retry_config,
             quiet,
             net_override,
+            network: None,
         }
     }
 
@@ -134,11 +139,26 @@ impl LiveTransport {
         }
     }
 
-    fn rpc_url(&self) -> &str {
-        self.net_override
-            .as_ref()
-            .map(|o| o.rpc_url.as_str())
-            .unwrap_or(DEFAULT_RPC_URL)
+    fn rpc_url(&self) -> Result<String> {
+        let network = self.network.as_deref().unwrap_or("testnet");
+        resolve_rpc_url(network, self.net_override.as_ref())
+    }
+}
+
+pub fn resolve_rpc_url(network: &str, net_override: Option<&NetworkOverride>) -> Result<String> {
+    if let Some(override_) = net_override {
+        return Ok(override_.rpc_url.clone());
+    }
+
+    match network.trim().to_ascii_lowercase().as_str() {
+        "testnet" | "test" => Ok(DEFAULT_RPC_URL.to_string()),
+        "futurenet" | "future" => Ok(FUTURENET_RPC_URL.to_string()),
+        "mainnet" | "pubnet" | "publicnet" | "public" => Ok(MAINNET_RPC_URL.to_string()),
+        "local" | "localnet" | "standalone" => Ok(LOCAL_RPC_URL.to_string()),
+        other => anyhow::bail!(
+            "no built-in RPC endpoint is configured for network alias {:?}; pass --rpc-url and --network-passphrase",
+            other
+        ),
     }
 }
 
@@ -150,6 +170,7 @@ impl Transport for LiveTransport {
         network: &str,
         _package_name: &str,
     ) -> Result<String> {
+        self.network = Some(network.to_string());
         let wasm_path_str = wasm_path
             .to_str()
             .context("wasm path is not valid UTF-8")?
@@ -225,7 +246,7 @@ impl Transport for LiveTransport {
         _function: &str,
     ) -> Result<Value> {
         let rpc_payload = crate::build_rpc_payload(b64_xdr);
-        let endpoint = self.rpc_url().to_string();
+        let endpoint = self.rpc_url()?.to_string();
 
         crate::run_with_retry(
             &self.retry_config,
@@ -237,5 +258,41 @@ impl Transport for LiveTransport {
             },
         )
         .map_err(anyhow::Error::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_supported_network_aliases() {
+        assert_eq!(resolve_rpc_url("testnet", None).unwrap(), DEFAULT_RPC_URL);
+        assert_eq!(
+            resolve_rpc_url("futurenet", None).unwrap(),
+            FUTURENET_RPC_URL
+        );
+        assert_eq!(resolve_rpc_url("local", None).unwrap(), LOCAL_RPC_URL);
+    }
+
+    #[test]
+    fn custom_rpc_override_has_precedence() {
+        let override_ = NetworkOverride {
+            rpc_url: "http://example.test/rpc".into(),
+            network_passphrase: "custom".into(),
+        };
+        assert_eq!(
+            resolve_rpc_url("futurenet", Some(&override_)).unwrap(),
+            "http://example.test/rpc"
+        );
+    }
+
+    #[test]
+    fn unknown_network_alias_requires_an_explicit_rpc_url() {
+        let error = resolve_rpc_url("private-net", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no built-in RPC endpoint"));
+        assert!(error.contains("--rpc-url"));
     }
 }

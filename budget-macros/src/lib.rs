@@ -90,6 +90,15 @@ impl Parse for StandaloneSpec {
         }
 
         input.parse::<Token![,]>()?;
+
+        // If nothing after the comma, treat as limit-only (no baseline).
+        if input.is_empty() {
+            return Ok(StandaloneSpec {
+                limit,
+                baseline: None,
+            });
+        }
+
         let ident: Ident = input.parse()?;
         if ident != "baseline" {
             return Err(syn::Error::new(
@@ -99,6 +108,10 @@ impl Parse for StandaloneSpec {
         }
         input.parse::<Token![=]>()?;
         let baseline: Expr = input.parse()?;
+
+        // Allow optional trailing comma after `baseline = …`.
+        // Consume a comma if present; ignore if absent.
+        let _ = input.parse::<Token![,]>();
 
         if !input.is_empty() {
             return Err(syn::Error::new(
@@ -156,6 +169,13 @@ fn resolve_env_file_at_expansion(path: &str) -> Option<PathBuf> {
     None
 }
 
+/// True for the four `BudgetLimit` *source* keys (`env`, `env_file`,
+/// `config`, `pct`). Shared by [`peeks_limit_source_key`] and the
+/// `BudgetSpec` unknown-key diagnostic so the two cannot drift apart.
+fn is_limit_source_key(name: &str) -> bool {
+    matches!(name, "env" | "env_file" | "config" | "pct")
+}
+
 /// True when the next tokens (optionally after a leading comma) name one of
 /// the `BudgetLimit` *source* keys.
 ///
@@ -169,12 +189,7 @@ fn peeks_limit_source_key(input: ParseStream) -> bool {
     }
     ahead
         .parse::<Ident>()
-        .map(|i| {
-            matches!(
-                i.to_string().as_str(),
-                "env" | "env_file" | "config" | "pct"
-            )
-        })
+        .map(|i| is_limit_source_key(&i.to_string()))
         .unwrap_or(false)
 }
 
@@ -184,7 +199,8 @@ fn peeks_limit_source_key(input: ParseStream) -> bool {
 /// Accepted forms:
 /// - An integer literal (e.g. `950_000`).
 /// - `env = "VAR_NAME"` to read the limit from a process environment
-///   variable at test time.
+///   variable at macro-expansion time. The variable must be set and contain a
+///   valid `u64`, or compilation fails with a diagnostic naming the variable.
 /// - `config = "key"` to read the limit from `budget.json` in the
 ///   process working directory.
 /// - `env_file = "PATH"` paired with `env = "VAR_NAME"`: read the limit
@@ -335,29 +351,48 @@ impl Parse for BudgetLimit {
 
                 // Reject trailing `env` or `config` keys — they provide an
                 // absolute value and are meaningless alongside `pct`.
+                // However, if a second `pct` follows the potential `env`/`config`,
+                // do not reject it here — the duplicate pct check (either immediately
+                // above, or on a subsequent loop iteration) will catch it instead.
                 if input.peek(Token![,]) {
                     let ahead = input.fork();
                     let _ = ahead.parse::<Token![,]>();
                     if ahead.peek(Ident) {
                         let ahead_key: Ident = ahead.parse().unwrap();
                         let key_name = ahead_key.to_string();
-                        if matches!(key_name.as_str(), "env" | "config") {
-                            return Err(syn::Error::new(
-                                ahead_key.span(),
-                                format!(
-                                    "`pct` cannot be combined with `{}` \
-                             — use `pct = N, of = env_file = \"...\", env = \"...\"` instead",
-                                    key_name
-                                ),
-                            ));
+                        // If the key is `env` or `config`, check whether a second
+                        // `pct` follows it. If so, skip the rejection so the duplicate
+                        // pct check can catch it later.
+                        if key_name.as_str() == "env" || key_name.as_str() == "config" {
+                            let second_pct_ahead = ahead.fork();
+                            // Skip the comma we already consumed, then look for `pct`
+                            let _ = second_pct_ahead.parse::<Token![,]>();
+                            // Suppress clippy warning: comparing Ident to string is unavoidable here.
+                            #[allow(clippy::cmp_owned)]
+                            if second_pct_ahead.peek(Ident)
+                                && second_pct_ahead.parse::<Ident>().unwrap().to_string() == "pct"
+                            {
+                                // Second `pct` follows `env`/`config` — skip rejection
+                                // so the duplicate check below can catch it.
+                            } else {
+                                return Err(syn::Error::new(
+                                    ahead_key.span(),
+                                    format!(
+                                        "`pct` cannot be combined with `{}` \
+                                 — use `pct = N, of = env_file = \"...\", env = \"...\"` instead",
+                                        key_name
+                                    ),
+                                ));
+                            }
                         }
+                        // If the key is NOT `env` or `config`, do nothing — the
+                        // key is handled by the outer parser, not the pct rejection.
                     }
                 }
 
-                // After parsing pct (+ optional of), stop: remaining tokens
-                // belong to the caller (a sibling `baseline = …`, or the
-                // enclosing spec).
-                break;
+                // After parsing pct (+ optional of), the loop continues so that
+                // a second `pct` can be detected via the duplicate check above.
+                // Do NOT break here: let the while loop iterate again.
             } else {
                 let lit: LitStr = input.parse()?;
                 match ident_str.as_str() {
@@ -453,6 +488,13 @@ impl Parse for BudgetLimit {
 impl Parse for BudgetSpec {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut spec = BudgetSpec::default();
+        // The span of the whole `key = value, …` list, used when no single
+        // token is at fault (no `cpu`/`mem` limit at all).
+        let args_span = input.span();
+        // Spans of the baseline keys, used when a baseline has no matching
+        // limit — the key the user wrote is the offending token.
+        let mut cpu_baseline_span: Option<Span> = None;
+        let mut mem_baseline_span: Option<Span> = None;
 
         while !input.is_empty() {
             let ident: Ident = input.parse()?;
@@ -466,9 +508,19 @@ impl Parse for BudgetSpec {
             } else if ident_str == "mem" {
                 spec.mem = Some(input.parse()?);
             } else if ident_str == "cpu_baseline" {
+                cpu_baseline_span = Some(ident.span());
                 spec.cpu_baseline = Some(input.parse()?);
             } else if ident_str == "mem_baseline" {
+                mem_baseline_span = Some(ident.span());
                 spec.mem_baseline = Some(input.parse()?);
+            } else if is_limit_source_key(&ident_str) {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    format!(
+                        "`{ident_str}` names a limit source, not a property \
+                         — use `cpu = {ident_str} = …` or `mem = {ident_str} = …`"
+                    ),
+                ));
             } else {
                 return Err(syn::Error::new(
                     ident.span(),
@@ -483,7 +535,7 @@ impl Parse for BudgetSpec {
 
         if spec.cpu.is_none() && spec.mem.is_none() {
             return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
+                args_span,
                 "must provide at least one of `cpu` or `mem` limits",
             ));
         }
@@ -493,13 +545,13 @@ impl Parse for BudgetSpec {
         // than let the assertion quietly not exist.
         if spec.cpu_baseline.is_some() && spec.cpu.is_none() {
             return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
+                cpu_baseline_span.unwrap_or(args_span),
                 "`cpu_baseline` requires a `cpu` limit",
             ));
         }
         if spec.mem_baseline.is_some() && spec.mem.is_none() {
             return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
+                mem_baseline_span.unwrap_or(args_span),
                 "`mem_baseline` requires a `mem` limit",
             ));
         }
@@ -508,12 +560,30 @@ impl Parse for BudgetSpec {
     }
 }
 
+fn validate_env_vars(limit: &BudgetLimit) -> syn::Result<()> {
+    match limit {
+        BudgetLimit::EnvVar(var) => match std::env::var(var) {
+            Ok(value) if value.trim().parse::<u64>().is_ok() => Ok(()),
+            Ok(value) => Err(syn::Error::new(
+                Span::call_site(),
+                format!("env var `{var}` has value {value:?}, which is not a valid u64"),
+            )),
+            Err(_) => Err(syn::Error::new(
+                Span::call_site(),
+                format!("env var `{var}` is not set at macro-expansion time"),
+            )),
+        },
+        BudgetLimit::Percentage { of, .. } => validate_env_vars(of),
+        _ => Ok(()),
+    }
+}
+
 fn generate_limit_expr(limit: &BudgetLimit, metric_label: &str) -> proc_macro2::TokenStream {
     match limit {
         BudgetLimit::Int(n) => quote! { #n },
         BudgetLimit::EnvVar(var) => quote! {
             budget_env_resolve(#var)
-                .map(|s| s.parse::<u64>().unwrap_or_else(|_| {
+                .map(|s| s.trim().parse::<u64>().unwrap_or_else(|_| {
                     panic!(
                         "{}: env var {}={:?} is not a valid u64",
                         #metric_label,
@@ -521,7 +591,13 @@ fn generate_limit_expr(limit: &BudgetLimit, metric_label: &str) -> proc_macro2::
                         s
                     )
                 }))
-                .unwrap_or(u64::MAX)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: env var {} is not set",
+                        #metric_label,
+                        #var
+                    )
+                })
         },
         BudgetLimit::Config(key) => quote! {
             std::fs::read_to_string(std::path::Path::new("budget.json"))
@@ -853,8 +929,8 @@ fn generate_metric_assert(
 /// read/write breakdown so a breach is never ambiguous about which side blew the
 /// budget.
 ///
-/// `ContractCostType` is referenced unqualified, so it must be in scope at the
-/// call site (e.g. `use soroban_sdk::ContractCostType;`).
+/// `ContractCostType` is referenced through its fully-qualified SDK path, so
+/// the call site needs no import for it.
 fn generate_ledger_assert(
     cost_ident: &proc_macro2::Ident,
     env_ident: &proc_macro2::Ident,
@@ -862,10 +938,10 @@ fn generate_ledger_assert(
     baseline: Option<&Expr>,
 ) -> proc_macro2::TokenStream {
     let read_entries = quote! {
-        #env_ident.cost_estimate().budget().tracker(ContractCostType::DiskReadEntries).iterations()
+        #env_ident.cost_estimate().budget().tracker(soroban_sdk::testutils::budget::ContractCostType::DiskReadEntries).iterations()
     };
     let write_entries = quote! {
-        #env_ident.cost_estimate().budget().tracker(ContractCostType::DiskWriteEntries).iterations()
+        #env_ident.cost_estimate().budget().tracker(soroban_sdk::testutils::budget::ContractCostType::DiskWriteEntries).iterations()
     };
     match baseline {
         None => quote! {
@@ -1044,6 +1120,7 @@ fn instrument_exit_paths(
                 #(#stmts)*
 
                 let __budget_value = #tail;
+                #[allow(unreachable_code)]
                 #assertion
                 __budget_value
             }
@@ -1054,6 +1131,7 @@ fn instrument_exit_paths(
 
                 #(#stmts)*
 
+                #[allow(unreachable_code)]
                 #assertion
             }
         },
@@ -1063,11 +1141,11 @@ fn instrument_exit_paths(
         Ok(block) => block,
         Err(e) => return Some(TokenStream::from(e.into_compile_error())),
     };
-    // A body ending in `return`/`panic!` makes the trailing assertion unreachable;
-    // the paths that do reach an exit already asserted.
-    input_fn
-        .attrs
-        .push(syn::parse_quote!(#[allow(unreachable_code)]));
+    // A body ending in `return`/`panic!` makes the trailing assertion
+    // unreachable, so the `#[allow(unreachable_code)]` above sits on that
+    // trailing assertion block only. The exit paths rewritten by
+    // `ReturnRewriter` already asserted, and genuine dead code in the user
+    // body still warns.
 
     None
 }
@@ -1130,6 +1208,12 @@ fn generate_prelude() -> proc_macro2::TokenStream {
 }
 
 fn generate_budget_assert(spec: BudgetSpec, mut input_fn: ItemFn, fn_label: &str) -> TokenStream {
+    for limit in [&spec.cpu, &spec.mem].into_iter().flatten() {
+        if let Err(error) = validate_env_vars(limit) {
+            return TokenStream::from(error.to_compile_error());
+        }
+    }
+
     let env_ident = spec
         .env_ident
         .unwrap_or_else(|| proc_macro2::Ident::new("env", proc_macro2::Span::call_site()));
@@ -1227,7 +1311,8 @@ fn generate_budget_assert(spec: BudgetSpec, mut input_fn: ItemFn, fn_label: &str
 ///
 /// ## Dynamic Limit via Environment Variable (`env = "VAR_NAME"`)
 ///
-/// Read the limit dynamically from an environment variable at test runtime:
+/// Read the limit from an environment variable available when the macro
+/// expands:
 ///
 /// ```rust,ignore
 /// use budget_macros::budget_cpu_lt;
@@ -1242,10 +1327,13 @@ fn generate_budget_assert(spec: BudgetSpec, mut input_fn: ItemFn, fn_label: &str
 /// ```
 ///
 /// When using `env = "VAR_NAME"`:
-/// - If the environment variable is **unset**, the limit defaults to `u64::MAX` ("no limit"),
-///   allowing the test assertion to pass unconditionally.
+/// - If the environment variable is **unset**, compilation fails with an error
+///   naming the variable; it never becomes an implicit "no limit".
 /// - If the environment variable is set to a string that **cannot be parsed as a `u64`**,
-///   the test panics at runtime with an explicit error naming the variable and invalid value.
+///   compilation fails with an error naming the variable and invalid value.
+///   Surrounding whitespace is trimmed before parsing, matching the `env_file`
+///   arm; other unparsable values (for example `"1000 Mbps"` or `"1_000"`)
+///   are rejected, never silently treated as "no limit".
 ///
 /// ## Limit from a `.env` File (`env_file = "PATH"` + `env = "VAR_NAME"`)
 ///
@@ -1273,6 +1361,15 @@ fn generate_budget_assert(spec: BudgetSpec, mut input_fn: ItemFn, fn_label: &str
 /// - If the file cannot be read, the test panics with the file path.
 /// - If the key is missing, the test panics with both the file path and the key.
 /// - If the value cannot be parsed as `u64`, the test panics with the raw value.
+///
+/// ## Percentage Limit (`pct = N, of = env_file = "PATH", env = "KEY"`)
+///
+/// The limit resolves at test time as `reference * pct / 100` with integer
+/// arithmetic (multiply first, then divide, truncating any fraction). A
+/// percentage limit is therefore only meaningful when the reference exceeds
+/// `100 / pct`: with a smaller reference the expression resolves to zero, so
+/// the assertion becomes `cost < 0`, which always fails (e.g. `pct = 1` of a
+/// `50`-unit reference resolves to limit `0`).
 ///
 /// Read the companion workflow in the project `README.md` (section
 /// "Deriving Tier A limits from a Tier B report") for how to populate
@@ -1309,6 +1406,10 @@ fn generate_bytes_proxy_assert(
     metric_phrase: &str,
     fn_label: &str,
 ) -> TokenStream {
+    if let Err(error) = validate_env_vars(&spec.limit) {
+        return TokenStream::from(error.to_compile_error());
+    }
+
     let limit_expr = generate_limit_expr(&spec.limit, metric_label);
 
     let env_ident = proc_macro2::Ident::new("env", proc_macro2::Span::call_site());
@@ -1472,17 +1573,27 @@ pub fn budget_events_lt(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return TokenStream::from(e.to_compile_error()),
     };
 
+    if let Err(error) = validate_env_vars(&spec.limit) {
+        return TokenStream::from(error.to_compile_error());
+    }
+
     let limit_expr = generate_limit_expr(&spec.limit, "budget_events_lt");
 
     let env_ident = proc_macro2::Ident::new("env", proc_macro2::Span::call_site());
     let cost_ident = proc_macro2::Ident::new("event_count", proc_macro2::Span::call_site());
+    let (plain, marginal) = assert_messages(
+        "Event count",
+        "local estimate, real network event counts may differ",
+        &spec.limit,
+        "",
+    );
     let assert_tokens = generate_metric_assert(
         &cost_ident,
         quote! { #env_ident.events().all().events().len() as u64 },
         &limit_expr,
         spec.baseline.as_ref(),
-        "Event count {} exceeded limit {} - local estimate, real network event counts may differ",
-        "Event count {} exceeded limit {} (marginal: {} measured - {} baseline) - local estimate, real network event counts may differ",
+        &plain,
+        &marginal,
     );
 
     let prelude = generate_prelude();
@@ -1514,9 +1625,10 @@ pub fn budget_events_lt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// budget. Read and write are deliberately summed rather than silently picked:
 /// the macro reports both.
 ///
-/// Counts come from `env.cost_estimate().budget().tracker(ContractCostType::DiskReadEntries)`
-/// and `…DiskWriteEntries`, summed. `ContractCostType` must be in scope at the
-/// call site (e.g. `use soroban_sdk::ContractCostType;`).
+/// Counts come from `env.cost_estimate().budget().tracker(…DiskReadEntries)`
+/// and `…DiskWriteEntries`, summed. The macro qualifies the SDK path itself
+/// (`soroban_sdk::testutils::budget::ContractCostType`), so no
+/// `ContractCostType` import is needed at the call site.
 ///
 /// Supports the same limit forms as the other macros.
 ///
@@ -1532,6 +1644,10 @@ pub fn budget_ledger_entries_lt(attr: TokenStream, item: TokenStream) -> TokenSt
         Ok(f) => f,
         Err(e) => return TokenStream::from(e.to_compile_error()),
     };
+
+    if let Err(error) = validate_env_vars(&spec.limit) {
+        return TokenStream::from(error.to_compile_error());
+    }
 
     let limit_expr = generate_limit_expr(&spec.limit, "budget_ledger_entries_lt");
 
@@ -1592,7 +1708,8 @@ pub fn budget_ledger_entries_lt(attr: TokenStream, item: TokenStream) -> TokenSt
 ///
 /// ## Dynamic Limit via Environment Variable (`env = "VAR_NAME"`)
 ///
-/// Read the limit dynamically from an environment variable at test runtime:
+/// Read the limit from an environment variable available while the macro
+/// expands:
 ///
 /// ```rust,ignore
 /// use budget_macros::budget_mem_lt;
@@ -1601,13 +1718,15 @@ pub fn budget_ledger_entries_lt(attr: TokenStream, item: TokenStream) -> TokenSt
 /// #[test]
 /// #[budget_mem_lt(env = "MAX_MEMORY_BYTES")]
 /// fn test_memory_budget_dynamic() {
-/// fn test_mem_budget_dynamic() {
 ///     let env = Env::default();
 ///     // ... setup contract client and invoke contract function ...
 /// }
 /// ```
 ///
 /// When using `env = "VAR_NAME"`:
+/// - The variable must be set while the macro expands and contain a valid `u64`.
+///   An unset or unparseable variable is a compile-time error rather than an
+///   implicit unlimited assertion.
 /// ## Limit from a `.env` File (`env_file = "PATH"` + `env = "VAR_NAME"`)
 ///
 /// Same as the `budget_cpu_lt` form: the limit is read at test runtime from
@@ -1615,10 +1734,10 @@ pub fn budget_ledger_entries_lt(attr: TokenStream, item: TokenStream) -> TokenSt
 /// the project `README.md` for the derivation workflow.
 ///
 /// When using `env = "VAR_NAME"` (no `env_file`):
-/// - If the environment variable is **unset**, the limit defaults to `u64::MAX` ("no limit"),
-///   allowing the test assertion to pass unconditionally.
+/// - If the environment variable is **unset**, compilation fails with an error
+///   naming the variable; it never becomes an implicit "no limit".
 /// - If the environment variable is set to a string that **cannot be parsed as a `u64`**,
-///   the test panics at runtime with an explicit error naming the variable and invalid value.
+///   compilation fails with an error naming the variable and invalid value.
 #[proc_macro_attribute]
 pub fn budget_mem_lt(attr: TokenStream, item: TokenStream) -> TokenStream {
     let spec = match syn::parse2::<StandaloneSpec>(attr.into()) {
@@ -1713,9 +1832,9 @@ struct ScalingConfig {
 
 impl Parse for ScalingConfig {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut sizes: Option<Vec<u32>> = None;
+        let mut sizes: Option<(Vec<(u32, Span)>, Span)> = None;
         let mut model: Option<GrowthModel> = None;
-        let mut tolerance: Option<f64> = None;
+        let mut tolerance: Option<(f64, Span)> = None;
 
         while !input.is_empty() {
             let ident: Ident = input.parse()?;
@@ -1723,24 +1842,35 @@ impl Parse for ScalingConfig {
 
             match ident.to_string().as_str() {
                 "sizes" => {
+                    // Span of the `[` token, so length errors point at the
+                    // sizes list instead of the whole attribute.
+                    let bracket_span = input.span();
                     let content;
                     syn::bracketed!(content in input);
                     let mut values = Vec::new();
                     while !content.is_empty() {
                         let lit: LitInt = content.parse()?;
-                        values.push(lit.base10_parse()?);
+                        let span = lit.span();
+                        let value: u32 = lit.base10_parse()?;
+                        values.push((value, span));
                         if !content.is_empty() {
                             let _ = content.parse::<Token![,]>();
                         }
                     }
-                    sizes = Some(values);
+                    sizes = Some((values, bracket_span));
                 }
                 "model" => {
                     model = Some(input.parse()?);
                 }
                 "tolerance" => {
+                    // Accept an optional leading `-` so a negative tolerance
+                    // reaches the range check below (with the literal's span)
+                    // instead of failing as "expected floating point literal".
+                    let neg: Option<Token![-]> = input.parse()?;
                     let lit: LitFloat = input.parse()?;
-                    tolerance = Some(lit.base10_parse()?);
+                    let span = lit.span();
+                    let value: f64 = lit.base10_parse()?;
+                    tolerance = Some((if neg.is_some() { -value } else { value }, span));
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -1758,18 +1888,50 @@ impl Parse for ScalingConfig {
             }
         }
 
-        let sizes = sizes.ok_or_else(|| input.error("missing required field `sizes`"))?;
+        let (sizes, sizes_span) =
+            sizes.ok_or_else(|| input.error("missing required field `sizes`"))?;
         if sizes.len() < 2 {
             return Err(syn::Error::new(
-                Span::call_site(),
+                sizes_span,
                 "`sizes` must contain at least two elements for ratio comparison",
+            ));
+        }
+        for (value, span) in &sizes {
+            if *value == 0 {
+                return Err(syn::Error::new(
+                    *span,
+                    "`sizes` must contain only strictly positive values, got 0",
+                ));
+            }
+        }
+        for window in sizes.windows(2) {
+            if window[1].0 <= window[0].0 {
+                return Err(syn::Error::new(
+                    window[1].1,
+                    format!(
+                        "`sizes` must be strictly ascending with distinct values, \
+                         got {} after {}",
+                        window[1].0, window[0].0
+                    ),
+                ));
+            }
+        }
+        let sizes: Vec<u32> = sizes.into_iter().map(|(value, _)| value).collect();
+        let (tolerance, tolerance_span) =
+            tolerance.ok_or_else(|| input.error("missing required field `tolerance`"))?;
+        if !(tolerance.is_finite() && tolerance >= 0.0) {
+            return Err(syn::Error::new(
+                tolerance_span,
+                format!(
+                    "`tolerance` must be a finite value greater than or equal to \
+                     zero, got {tolerance}"
+                ),
             ));
         }
         Ok(ScalingConfig {
             sizes,
             model: model.ok_or_else(|| input.error("missing required field `model`"))?,
-            tolerance: tolerance
-                .ok_or_else(|| input.error("missing required field `tolerance`"))?,
+            tolerance,
         })
     }
 }
@@ -1778,13 +1940,14 @@ fn generate_scaling_assert(config: ScalingConfig, input_fn: ItemFn) -> TokenStre
     let name = &input_fn.sig.ident;
     let body = &input_fn.block;
     let vis = &input_fn.vis;
+    let inputs = &input_fn.sig.inputs;
+    let output = &input_fn.sig.output;
 
-    // Preserve user attributes (e.g. #[should_panic]) and add #[test] if needed.
-    let mut attrs: Vec<Attribute> = input_fn.attrs.clone();
-    let has_test = attrs.iter().any(|a| a.path().is_ident("test"));
-    if !has_test {
-        attrs.push(parse_quote!(#[test]));
-    }
+    // Preserve user attributes (e.g. #[should_panic]). Do not automatically add
+    // #[test] - the user should add it if they want the function to run as a test.
+    // This allows the macro to work in both test and non-test contexts (e.g. pass
+    // fixtures that run as binaries).
+    let attrs: Vec<Attribute> = input_fn.attrs.clone();
 
     let sizes_values = &config.sizes;
     let tolerance = config.tolerance;
@@ -1815,7 +1978,7 @@ fn generate_scaling_assert(config: ScalingConfig, input_fn: ItemFn) -> TokenStre
 
     TokenStream::from(quote! {
         #(#attrs)*
-        #vis fn #name() {
+        #vis fn #name(#inputs) #output {
             const __SIZES: &[u32] = &[#(#sizes_values),*];
             const __TOLERANCE: f64 = #tolerance;
 
@@ -1826,12 +1989,26 @@ fn generate_scaling_assert(config: ScalingConfig, input_fn: ItemFn) -> TokenStre
                 let env = soroban_sdk::Env::default();
                 env.cost_estimate().budget().reset_unlimited();
 
+                let size = size;
                 #body
 
                 let __cost = env.cost_estimate().budget()
                     .cpu_instruction_cost();
                 __measurements.push((size, __cost));
             }
+
+            // Guard: ensure the body executed once per size. If the body contains
+            // `return`, `break`, or `continue` that exits the measurement loop
+            // early, `__measurements.len()` will be less than `__SIZES.len()` and
+            // the ratio checks below would have an empty range and silently pass.
+            assert!(
+                __measurements.len() == __SIZES.len(),
+                "not all sizes were measured - the body may contain `return`, `break`, \
+                 or `continue` that exits the measurement loop early; expected \
+                 {} measurements, got {}",
+                __SIZES.len(),
+                __measurements.len(),
+            );
 
             for i in 1..__measurements.len() {
                 let (__prev_s, __prev_c) = __measurements[i - 1];
@@ -1872,6 +2049,7 @@ fn generate_scaling_assert(config: ScalingConfig, input_fn: ItemFn) -> TokenStre
 /// # Attribute syntax
 ///
 /// ```rust,ignore
+/// #[test]
 /// #[budget_scaling(
 ///     sizes = [10, 100, 1000],
 ///     model = linear,
@@ -1888,10 +2066,12 @@ fn generate_scaling_assert(config: ScalingConfig, input_fn: ItemFn) -> TokenStre
 /// | `model`     | `linear` / `quadratic` | Expected growth model. |
 /// | `tolerance` | `f64`             | Allowed relative deviation from expected ratio (e.g. `0.3` = 30 %). |
 ///
-/// The annotated function becomes a `#[test]` function.  The macro:
+/// The annotated function should be marked with `#[test]` by the user if they
+/// want it to run as a test. The macro:
 ///
 /// 1. Creates a fresh `Env` for each size.
-/// 2. Resets the budget and runs the function body.
+/// 2. Resets the budget and runs the function body (with `size` bound to the
+///    current iteration value).
 /// 3. Records `cpu_instruction_cost()`.
 /// 4. Compares consecutive (size, cost) pairs against the model.
 ///
@@ -2271,6 +2451,22 @@ mod tests {
     }
 
     #[test]
+    fn a_standalone_spec_accepts_a_trailing_comma() {
+        // A bare limit with a trailing comma should parse as limit-only.
+        let spec = parse_str::<StandaloneSpec>("1000,")
+            .expect("a limit with trailing comma parses as limit-only");
+        assert!(spec.baseline.is_none());
+    }
+
+    #[test]
+    fn a_standalone_spec_accepts_baseline_with_trailing_comma() {
+        // A limit with baseline and a trailing comma should parse successfully.
+        let spec = parse_str::<StandaloneSpec>("1000, baseline = 100,")
+            .expect("limit with baseline and trailing comma parses");
+        assert!(spec.baseline.is_some());
+    }
+
+    #[test]
     fn an_env_sourced_limit_accepts_a_baseline_too() {
         // A sourced limit must also stop before `, baseline`, leaving it for
         // the enclosing `StandaloneSpec` to consume.
@@ -2454,6 +2650,72 @@ mod tests {
         assert!(
             err.contains("unknown property"),
             "diagnostic {err:?} should report the unknown property first"
+        );
+    }
+
+    // ── nested `pct` inside `#[budget_lt(...)]` (#869) ─────────────────────
+    //
+    // `BudgetLimit::parse` stops after `pct = N, of = …` and hands the
+    // sibling `, mem = …` back to `BudgetSpec::parse`. This pins that
+    // hand-off: a `cpu` percentage plus a literal `mem` limit in one spec.
+
+    #[test]
+    fn a_nested_pct_cpu_limit_parses_alongside_a_literal_mem_limit() {
+        let spec = parse_str::<BudgetSpec>(
+            "cpu = pct = 25, of = env_file = \"tests/ui/support/pass_env_file.env\", \
+             env = \"PCT_TEST_CPU_NETWORK\", mem = 500",
+        )
+        .expect("a nested pct cpu limit with a sibling mem limit parses");
+        assert!(
+            matches!(spec.cpu, Some(BudgetLimit::Percentage { pct: 25, .. })),
+            "cpu should be a 25% percentage limit"
+        );
+        assert!(
+            matches!(spec.mem, Some(BudgetLimit::Int(500))),
+            "mem should stay a literal limit"
+        );
+    }
+
+    // ── spec-level limit-source keys (#868) ─────────────────────────────────
+    //
+    // `env`, `env_file`, `config` and `pct` are legal one level down, so a
+    // bare `#[budget_lt(env = …)]` gets a diagnostic naming the source key
+    // and the `cpu = …` / `mem = …` form instead of the generic
+    // "unknown property".
+
+    #[test]
+    fn spec_level_limit_sources_suggest_the_metric_form() {
+        for source in [
+            "env = \"X\"",
+            "env_file = \"f\", env = \"X\"",
+            "config = \"k\"",
+            "pct = 50, of = env_file = \"f\", env = \"X\"",
+        ] {
+            let err = parse_str::<BudgetSpec>(source)
+                .err()
+                .expect("a spec-level limit source must be rejected")
+                .to_string();
+            let key = source.split_whitespace().next().expect("source has a key");
+            assert!(
+                err.contains(key),
+                "diagnostic {err:?} should name the offending key `{key}`"
+            );
+            assert!(
+                err.contains("cpu ="),
+                "diagnostic {err:?} should show the `cpu = …` form"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuinely_unknown_spec_key_still_reports_unknown_property() {
+        let err = parse_str::<BudgetSpec>("unknown_prop = 1000")
+            .err()
+            .expect("an unknown key must be rejected")
+            .to_string();
+        assert!(
+            err.contains("unknown property"),
+            "diagnostic {err:?} should keep the generic wording"
         );
     }
 }

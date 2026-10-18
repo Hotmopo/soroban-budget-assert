@@ -85,10 +85,9 @@ fn cpu_below_baseline_saturates() {
     let env = Env::new(10, 0);
 }
 
-/// A sourced limit can be combined with a baseline. An unset environment
-/// variable resolves to `u64::MAX`, so this case passes without relying on the
+/// A literal limit can be combined with a baseline without relying on the
 /// process environment.
-#[budget_cpu_lt(env = "PASS_BASELINE_UNSET_LIMIT", baseline = floor())]
+#[budget_cpu_lt(500, baseline = floor())]
 fn cpu_baseline_with_env_limit() {
     let env = Env::new(1_200, 0);
 }

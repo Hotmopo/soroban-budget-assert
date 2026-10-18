@@ -116,6 +116,22 @@ pub enum ContractCostType {
     DiskWriteEntries,
 }
 
+/// Mirrors the SDK's real re-export paths
+/// (`soroban_sdk::testutils::budget::ContractCostType`, itself re-exported
+/// from `soroban_sdk::xdr`) so fixtures resolve the qualified path the ledger
+/// macro emits without pulling in the real SDK.
+#[allow(unused_imports)]
+pub mod soroban_sdk {
+    pub mod testutils {
+        pub mod budget {
+            pub use super::super::super::ContractCostType;
+        }
+    }
+    pub mod xdr {
+        pub use super::super::ContractCostType;
+    }
+}
+
 /// Stand-in for `soroban_sdk`'s cost tracker returned by `Budget::tracker`.
 pub struct CostTracker {
     iterations: u64,

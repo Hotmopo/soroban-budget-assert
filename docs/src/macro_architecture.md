@@ -491,9 +491,32 @@ Several decisions preserve Rust's hygiene guarantees:
 
 Both `generate_budget_assert()` (via `generate_limit_expr()`) and `budget_write_bytes_lt` compile their own JSON-parsing fallback for `Config` limits. The compile-time path (`resolve_config_value` + `serde_json`) is shared, but the runtime fallback code is emitted inline in each limit expression because `quote!` does not support emitting a shared helper function across separate expansion sites without additional abstractions. Keeping the fallback self-contained in each expansion avoids a cross-contamination risk where one macro's expansion depends on another's.
 
-### `spec.env_ident` Flexibility
+### `spec.env_ident` Support
 
-`BudgetSpec` supports an `env_ident` field that overrides the variable name used for `env.cost_estimate().budget()`. This is currently unused by the public macros (they all pass `None`, defaulting to `"env"`), but the field exists in the parser and the data structure so that a future macro or custom attribute can target a differently named variable without forking the expansion logic.
+`BudgetSpec` carries an `env_ident` field (`budget-macros/src/lib.rs:67`,
+parsed at `:469-470`) that overrides the variable name read by
+`env.cost_estimate().budget()`; `generate_budget_assert()` honours it at
+`:1142-1144`. Exactly one public macro accepts it — the rest either reject the
+key in the parser or force the identifier to `env` by construction:
+
+| Macro | `env_ident` |
+|---|---|
+| `#[budget_lt(...)]` | Accepted — the parsed spec is passed straight through (`:1671-1673`), so `#[budget_lt(cpu = 5, env_ident = my_env)]` measures `my_env` |
+| `#[budget_cpu_lt(...)]` | Rejected by the parser (`StandaloneSpec` only allows `baseline`); the expansion passes `env_ident: None`, defaulting to `env` (`:1302`) |
+| `#[budget_mem_lt(...)]` | Rejected by the parser; the expansion passes `env_ident: None`, defaulting to `env` (`:1645`) |
+| `#[budget_write_bytes_lt(...)]`, `#[budget_read_bytes_lt(...)]` | Rejected by the parser; `generate_bytes_proxy_assert` hardcodes the identifier to `env` (`:1323`) |
+| `#[budget_events_lt(...)]`, `#[budget_ledger_entries_lt(...)]` | Rejected by the parser; each hardcodes the identifier to `env` (`:1486`, `:1548`) |
+| `#[budget_scaling(...)]` | Not applicable — it parses a separate `ScalingConfig` (`sizes`/`model`/`tolerance`) and creates its own fresh `Env` per size (`:1836`) |
+
+The value must be a single identifier (`Option<Ident>` at `:67`):
+`env_ident = my_env` parses, but a field or method path such as
+`env_ident = self.env` does not. Consequently a method whose environment
+lives in a field cannot be targeted — bind it to a local first. Lifting that
+limitation would be a code change, out of scope for this docs fix.
+
+Verified against `budget-macros/src/lib.rs` and the parser unit test
+`a_spec_honours_an_explicit_env_ident` (run via `cargo test -p budget-macros`),
+which parses `cpu = 1000, env_ident = my_env` and asserts the ident is stored.
 
 ## Extension Guide
 
