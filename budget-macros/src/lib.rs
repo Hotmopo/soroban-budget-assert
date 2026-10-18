@@ -1917,6 +1917,7 @@ impl Parse for ScalingConfig {
             }
         }
         let sizes: Vec<u32> = sizes.into_iter().map(|(value, _)| value).collect();
+        let model = model.ok_or_else(|| input.error("missing required field `model`"))?;
         let (tolerance, tolerance_span) =
             tolerance.ok_or_else(|| input.error("missing required field `tolerance`"))?;
         if !(tolerance.is_finite() && tolerance >= 0.0) {
@@ -1930,7 +1931,7 @@ impl Parse for ScalingConfig {
         }
         Ok(ScalingConfig {
             sizes,
-            model: model.ok_or_else(|| input.error("missing required field `model`"))?,
+            model,
             tolerance,
         })
     }
