@@ -371,7 +371,7 @@ dependencies = [
  "proc-macro2",
  "proptest",
  "quote",
- "soroban-sdk",
+ "soroban-sdk 27.0.6",
  "syn 3.0.6",
  "trybuild",
 ]
